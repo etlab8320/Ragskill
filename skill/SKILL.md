@@ -572,9 +572,11 @@ def evaluate_retrieval(query: str, chunks: list[dict]) -> tuple[list[dict], str]
             max_tokens=10
         ).strip().upper()
 
-        if verdict == "CORRECT":
+        if "INCORRECT" in verdict:
+            pass  # skip
+        elif "CORRECT" in verdict:
             correct.append(chunk)
-        elif verdict == "AMBIGUOUS":
+        elif "AMBIGUOUS" in verdict:
             ambiguous.append(chunk)
 
     if correct:
@@ -646,17 +648,22 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
 
 ### Agentic RAG (for complex queries)
 
-> **Note:** Agentic RAG requires tool_use, so set `RAG_LLM_MODE` to `claude-api`, `gemini`, or `openai`.
-> CLI mode (`claude-cli`) does not support tool_use.
+> **Note:** Agentic RAG requires `RAG_LLM_MODE=claude-api` (Anthropic Messages API with tool_use).
+> CLI mode does not support tool_use. Gemini/OpenAI tool_use adapters are not yet implemented.
 
 ```python
 # agentic_rag.py
 """Agent-driven retrieval: plan → search → validate → re-search if needed.
-Requires API mode (RAG_LLM_MODE=claude-api, gemini, or openai).
-Implementation below uses Anthropic Messages API; adapt for other providers.
+Requires RAG_LLM_MODE=claude-api (Anthropic Messages API with tool_use).
+Gemini/OpenAI tool_use adapters not yet implemented.
 """
 from llm import get_api_client
 client, model_name, provider = get_api_client()
+if provider != "anthropic":
+    raise NotImplementedError(
+        f"Agentic RAG currently uses Anthropic Messages API. "
+        f"Got provider={provider}. Set RAG_LLM_MODE=claude-api."
+    )
 
 TOOLS = [
     {

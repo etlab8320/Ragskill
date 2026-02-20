@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/main/install.sh 
 
 ```bash
 mkdir -p ~/.claude/skills/rag-pipeline
-curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/main/skill/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.0.0/skill/SKILL.md \
   -o ~/.claude/skills/rag-pipeline/SKILL.md
 ```
 
