@@ -17,7 +17,7 @@ Build production-grade RAG systems based on comprehensive research across 30+ te
 | Reranking | **Voyage `rerank-2`** | Cross-encoder reranking |
 | Vector DB | **pgvector + pgvectorscale** | 471 QPS at 50M vectors (10x faster than Qdrant) |
 | Keyword Search | **PostgreSQL tsvector** | Same DB, no extra infra |
-| LLM | **Claude (API or CLI)** | Generation + context enrichment |
+| LLM | **Any (Claude / Gemini / OpenAI)** | Generation + context enrichment |
 | Evaluation | **RAGAS** | Faithfulness, precision, recall |
 | Monitoring | **Langfuse** (open-source) | Production observability |
 
@@ -61,19 +61,21 @@ for env_file in [".env", ".env.local"]:
    - Ask: "키를 .env 파일에 추가할까요?" → `echo 'VOYAGE_API_KEY=your-key-here' >> .env`
    - **Alternative**: "Voyage 없이 진행하려면 로컬 모델(bge-m3)로 대체 가능합니다."
 4. If **ANTHROPIC_API_KEY missing**:
-   - Display: "Claude API 키가 필요합니다 (contextual enrichment + generation용)."
-   - Guide: "https://console.anthropic.com/ → API Keys"
-   - **Alternative**: "Claude CLI가 설치되어 있으면 API 키 없이 CLI 모드로 사용 가능합니다."
-   - CLI 모드 설정: `export RAG_LLM_MODE=cli`
-5. If both present → proceed to Question Flow
+   - Display: "Claude API 키가 없습니다. LLM 대안을 선택하세요:"
+   - **Option A**: Claude CLI 모드 → `export RAG_LLM_MODE=claude-cli` (API 키 불필요)
+   - **Option B**: Gemini Flash (가장 저렴) → `export RAG_LLM_MODE=gemini` + `GEMINI_API_KEY`
+   - **Option C**: OpenAI → `export RAG_LLM_MODE=openai` + `OPENAI_API_KEY`
+   - **Option D**: Claude API → "https://console.anthropic.com/ → API Keys"
+5. Also check for `GEMINI_API_KEY`, `OPENAI_API_KEY` — auto-detect available provider
+6. If at least one LLM provider available → proceed to Question Flow
 
 **Fallback stack (API 키 없을 때):**
 
-| Layer | With Voyage API | Without (Local fallback) |
-|-------|----------------|--------------------------|
+| Layer | With API Keys | Without (Fallback) |
+|-------|--------------|---------------------|
 | Embedding | voyage-4-large | bge-m3 (open-source, CPU OK) |
 | Reranking | rerank-2 | Cross-encoder: ms-marco-MiniLM-L-6-v2 |
-| LLM | Claude API | Ollama (llama3, local) |
+| LLM | Claude API / Gemini / OpenAI | Claude CLI (plan) or Ollama (local) |
 
 ## Question Flow
 
@@ -205,46 +207,87 @@ def semantic_chunk(text: str, source: str, max_tokens: int = 512) -> list[Chunk]
 
 ### Step 2: LLM Wrapper (API or CLI)
 
-Voyage handles embedding/reranking only. LLM (enrichment, CRAG, generation) is separate — use **Claude API** or **Claude CLI**, your choice.
+Voyage handles embedding/reranking only. LLM (enrichment, CRAG, generation) is separate — choose any provider.
 
 ```python
-# llm.py — LLM abstraction layer
+# llm.py — Multi-LLM abstraction layer
 import os
 import subprocess
 
-MODE = os.environ.get("RAG_LLM_MODE", "api")  # "api" or "cli"
+MODE = os.environ.get("RAG_LLM_MODE", "claude-api")
+# Supported: "claude-api", "claude-cli", "gemini", "openai"
 
-if MODE == "api":
-    import anthropic
-    _client = anthropic.Anthropic()
+def llm(prompt: str, max_tokens: int = 300) -> str:
+    """Call LLM via configured provider."""
 
-def llm(prompt: str, model: str = "claude-haiku-4-5-20251001", max_tokens: int = 300) -> str:
-    """Call Claude via API or CLI."""
-    if MODE == "api":
-        resp = _client.messages.create(
-            model=model,
+    if MODE == "claude-api":
+        import anthropic
+        resp = anthropic.Anthropic().messages.create(
+            model=os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.content[0].text
-    else:
-        # Claude CLI — no API key needed if already authenticated
+
+    elif MODE == "claude-cli":
         result = subprocess.run(
-            ["claude", "-p", prompt, "--model", model],
+            ["claude", "-p", prompt, "--model",
+             os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")],
             capture_output=True, text=True, timeout=60
         )
         return result.stdout.strip()
+
+    elif MODE == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        model = genai.GenerativeModel(
+            os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
+        )
+        return model.generate_content(prompt).text
+
+    elif MODE == "openai":
+        from openai import OpenAI
+        resp = OpenAI().chat.completions.create(
+            model=os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"),
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.choices[0].message.content
+
+    else:
+        raise ValueError(f"Unknown RAG_LLM_MODE: {MODE}")
+```
+
+**설정 예시:**
+
+```bash
+# Claude API (기본값)
+export RAG_LLM_MODE=claude-api
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Claude CLI (API 키 불필요)
+export RAG_LLM_MODE=claude-cli
+
+# Gemini Flash (가장 저렴)
+export RAG_LLM_MODE=gemini
+export GEMINI_API_KEY=AI...
+export RAG_LLM_MODEL=gemini-2.0-flash  # optional
+
+# OpenAI
+export RAG_LLM_MODE=openai
+export OPENAI_API_KEY=sk-...
+export RAG_LLM_MODEL=gpt-4o-mini  # optional
 ```
 
 **선택 기준:**
 
-| | Claude API | Claude CLI |
-|--|-----------|-----------|
-| 속도 | 빠름 (직접 호출) | 약간 느림 (프로세스 스폰) |
-| 인증 | ANTHROPIC_API_KEY 필요 | `claude` 로그인만 되어있으면 됨 |
-| 비용 | API 사용량 과금 | CLI 플랜에 포함 |
-| 배치 처리 | 병렬 가능 | 순차 권장 |
-| 프로덕션 | 권장 | 개발/프로토타입에 적합 |
+| | Claude API | Claude CLI | Gemini Flash | OpenAI |
+|--|-----------|-----------|-------------|--------|
+| 비용 | 사용량 과금 | 플랜 포함 | **가장 저렴** | 사용량 과금 |
+| 속도 | 빠름 | 느림 | **가장 빠름** | 빠름 |
+| tool_use | 지원 | 미지원 | 지원 | 지원 |
+| Agentic RAG | 가능 | 불가 | 가능 | 가능 |
+| 프로덕션 | 권장 | 개발용 | 비용 최적 | 범용 |
 
 ### Step 3: Contextual Enrichment
 

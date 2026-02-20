@@ -41,7 +41,7 @@ Claude Code에서:
 | 리랭킹 | **Voyage `rerank-2`** | Cross-encoder |
 | 벡터 DB | **pgvector + pgvectorscale** | 50M 벡터에서 471 QPS |
 | 키워드 | **PostgreSQL tsvector** | 같은 DB, 추가 인프라 없음 |
-| LLM | **Claude (API or CLI)** | 생성 + 맥락 강화, API 키 없이 CLI 모드 가능 |
+| LLM | **Any (Claude / Gemini / OpenAI)** | 생성 + 맥락 강화, 원하는 LLM 선택 가능 |
 | 평가 | **RAGAS** | Faithfulness, Precision, Recall |
 | 모니터링 | **Langfuse** (오픈소스) | 프로덕션 관측성 |
 
@@ -110,22 +110,24 @@ Claude Code에서:
 - API 키가 없어도 로컬 모델(bge-m3)로 폴백 가능합니다.
 - **Claude CLI가 설치되어 있으면 `ANTHROPIC_API_KEY` 없이 CLI 모드로 사용 가능합니다.**
 
-## LLM 모드 선택 (API vs CLI)
+## LLM 모드 선택 (Multi-LLM)
 
-`RAG_LLM_MODE` 환경변수로 LLM 호출 방식을 선택합니다:
+`RAG_LLM_MODE` 환경변수로 LLM 제공자를 선택합니다:
 
 ```bash
-export RAG_LLM_MODE=api   # Claude API (기본값, 빠름, tool_use 지원)
-export RAG_LLM_MODE=cli   # Claude CLI (API 키 불필요, 플랜만 있으면 됨)
+export RAG_LLM_MODE=claude-api   # Claude API (기본값)
+export RAG_LLM_MODE=claude-cli   # Claude CLI (API 키 불필요)
+export RAG_LLM_MODE=gemini       # Gemini Flash (가장 저렴)
+export RAG_LLM_MODE=openai       # OpenAI
 ```
 
-| 항목 | API 모드 | CLI 모드 |
-|------|----------|----------|
-| 필요한 것 | `ANTHROPIC_API_KEY` | Claude Code 설치 + 플랜 |
-| 속도 | 빠름 | 약간 느림 (subprocess) |
-| tool_use | 지원 | 미지원 |
-| Agentic RAG | 가능 | 불가 (API 전용) |
-| 비용 | API 사용량 기반 | 플랜에 포함 |
+| 항목 | Claude API | Claude CLI | Gemini Flash | OpenAI |
+|------|-----------|-----------|-------------|--------|
+| 비용 | 사용량 과금 | 플랜 포함 | **가장 저렴** | 사용량 과금 |
+| 속도 | 빠름 | 느림 | **가장 빠름** | 빠름 |
+| tool_use | 지원 | 미지원 | 지원 | 지원 |
+| Agentic RAG | 가능 | 불가 | 가능 | 가능 |
+| 프로덕션 | 권장 | 개발용 | 비용 최적 | 범용 |
 
 ## 포함된 코드 템플릿
 
