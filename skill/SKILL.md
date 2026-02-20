@@ -381,13 +381,14 @@ def _call_claude_cli(prompt: str, max_tokens: int, model: str) -> str:
 
 @retry(**_retry_config((LLMError, RateLimitError)))
 def _call_gemini(prompt: str, max_tokens: int, model: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=settings.gemini_api_key)
+    from google import genai
+    from google.genai import types
     try:
-        gmodel = genai.GenerativeModel(model)
-        resp = gmodel.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(max_output_tokens=max_tokens),
+        client = genai.Client(api_key=settings.gemini_api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=max_tokens),
         )
         return resp.text
     except Exception as e:
@@ -436,8 +437,6 @@ def get_api_client():
             "anthropic",
         )
     elif MODE == "gemini":
-        import google.generativeai as genai
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
         model_name = os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
         return None, model_name, "gemini"
     elif MODE == "openai":
@@ -1225,7 +1224,7 @@ ragas>=0.2.0,<1.0
 langfuse>=2.0,<4.0
 datasets>=3.0,<4.0
 # Multi-LLM (install as needed based on RAG_LLM_MODE)
-google-generativeai>=0.8.0,<1.0  # RAG_LLM_MODE=gemini
+google-genai>=1.0.0,<2.0         # RAG_LLM_MODE=gemini (신규 SDK: from google import genai)
 openai>=1.50.0,<2.0              # RAG_LLM_MODE=openai
 # Development / Testing
 pytest>=8.0,<9.0
