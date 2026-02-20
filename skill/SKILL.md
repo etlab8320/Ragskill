@@ -656,6 +656,7 @@ from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 from config import settings
 from exceptions import StorageError
+from chunking import Chunk
 
 logger = logging.getLogger(__name__)
 
@@ -1403,6 +1404,317 @@ python ingest.py ./data/*.pdf
 
 # 4. API 서버 시작
 python app.py  # FastAPI on :8000
+```
+
+---
+
+## TESTING
+
+Production-grade RAG pipelines need unit tests. This section provides the testing scaffold so Claude Code can generate a complete test suite alongside the pipeline.
+
+### Two-Layer Architecture
+
+```
+Layer 1: validate_skill.py  — SKILL.md 문법 + 필수 패턴 검증 (py_compile + regex)
+Layer 2: pytest unit tests  — 외부 API 전부 mock, 순수 로직만 검증
+```
+
+### Mock Targets (중요)
+
+Python의 `from x import y` 패턴은 patch 대상이 달라진다:
+
+| 모듈이 사용하는 방식 | patch 대상 |
+|---------------------|-----------|
+| `from llm import llm` (crag.py) | `patch("crag.llm")` |
+| `voyageai.Client()` (embedding.py) | `patch("embedding.vo")` |
+| `from psycopg_pool import ConnectionPool` (storage.py) | `patch("storage.ConnectionPool")` |
+| `_embed_batch_raw` (embedding.py 내부) | `patch("embedding._embed_batch_raw")` |
+
+### conftest.py (SKILL.md Named Block 추출기)
+
+SKILL.md 코드 블록을 pytest 실행 전에 임시 디렉토리로 추출해 `sys.path`에 추가한다.
+이 방식 덕분에 test 파일 최상단에서 `from crag import _parse_verdict` 같은 import가 작동.
+
+```python
+# Example: root conftest.py (place at project root, NOT in tests/)
+"""
+루트 conftest.py — SKILL.md Python 블록을 conftest 로드 시점에 추출해 sys.path에 추가.
+"""
+
+import re
+import sys
+import atexit
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+
+SKILL_MD = Path(__file__).parent / "skill" / "SKILL.md"
+
+
+def _extract_named_blocks(skill_path: Path) -> dict[str, str]:
+    text = skill_path.read_text(encoding="utf-8")
+    raw_blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+
+    blocks = {}
+    for block in raw_blocks:
+        first_line = block.split("\n")[0].strip()
+        match = re.match(r"^#\s+([\w]+\.py)", first_line)
+        if match:
+            name = match.group(1)
+            if name not in blocks:
+                blocks[name] = block
+    return blocks
+
+
+def _setup_skill_modules() -> str:
+    """SKILL.md 블록을 임시 디렉토리에 쓰고 경로 반환."""
+    tmp_dir = tempfile.mkdtemp(prefix="ragskill_modules_")
+    blocks = _extract_named_blocks(SKILL_MD)
+    for filename, code in blocks.items():
+        Path(tmp_dir, filename).write_text(code, encoding="utf-8")
+    return tmp_dir
+
+
+# conftest.py 로드(= collection 전) 시점에 즉시 실행
+_modules_dir = _setup_skill_modules()
+sys.path.insert(0, _modules_dir)
+
+# 프로세스 종료 시 임시 디렉토리 정리
+atexit.register(shutil.rmtree, _modules_dir, True)
+
+
+@pytest.fixture
+def mock_voyage():
+    from unittest.mock import MagicMock, patch
+    with patch("voyageai.Client") as mock:
+        client = MagicMock()
+        client.embed.return_value = MagicMock(embeddings=[[0.1] * 1024])
+        client.rerank.return_value = MagicMock(
+            results=[MagicMock(index=0, relevance_score=0.9)]
+        )
+        client.embed_chunks.return_value = MagicMock(embeddings=[[[0.1] * 1024]])
+        mock.return_value = client
+        yield client
+
+
+@pytest.fixture
+def mock_pool():
+    """ConnectionPool 클래스 mock을 yield (인스턴스가 아닌 클래스).
+    mock_pool          = ConnectionPool 클래스 mock (call_count 확인용)
+    mock_pool.return_value = pool 인스턴스
+    mock_pool.return_value.connection.return_value = conn
+    """
+    from unittest.mock import MagicMock, patch
+    with patch("storage.ConnectionPool") as mock_cls:
+        pool = MagicMock()
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            {
+                "id": "1",
+                "content": "test content",
+                "context": "test context",
+                "summary": "test summary",
+                "metadata": {"source": "test.pdf"},
+                "rrf_score": 0.9,
+            }
+        ]
+        conn.__enter__ = MagicMock(return_value=conn)
+        conn.__exit__ = MagicMock(return_value=False)
+        cursor.__enter__ = MagicMock(return_value=cursor)
+        cursor.__exit__ = MagicMock(return_value=False)
+        conn.cursor.return_value = cursor
+        pool.connection.return_value = conn
+        mock_cls.return_value = pool
+        yield mock_cls  # ⚠️ 반드시 mock_cls를 yield (pool이 아님)
+
+
+@pytest.fixture
+def sample_chunks():
+    from chunking import Chunk
+    return [
+        Chunk(
+            content="Exercise improves cardiovascular health.",
+            metadata={"source": "test.pdf", "chunk_index": 0},
+            context="From a sports science paper about exercise.",
+            summary="Exercise benefits cardiovascular system.",
+            embedding=[0.1] * 1024,
+        ),
+        Chunk(
+            content="Mental toughness helps athletes perform under pressure.",
+            metadata={"source": "mental.pdf", "chunk_index": 0},
+            context="From a sports psychology paper.",
+            summary="Mental toughness and performance.",
+            embedding=[0.2] * 1024,
+        ),
+    ]
+
+
+@pytest.fixture
+def sample_chunk_dicts():
+    return [
+        {
+            "id": "1",
+            "content": "Exercise improves cardiovascular health and VO2max.",
+            "context": "From a sports physiology paper on aerobic capacity.",
+            "summary": "Exercise cardiovascular benefits.",
+            "metadata": {"source": "sports.pdf"},
+            "rrf_score": 0.9,
+        },
+        {
+            "id": "2",
+            "content": "Mental toughness is a key predictor of athletic success.",
+            "context": "From a sports psychology study.",
+            "summary": "Mental toughness and athletic performance.",
+            "metadata": {"source": "mental.pdf"},
+            "rrf_score": 0.7,
+        },
+    ]
+```
+
+> **⚠️ 주의**: `tests/conftest.py`와 루트 `conftest.py`에 같은 fixture 이름이 있으면 하위 디렉토리 conftest 우선. 중복 정의 금지.
+
+### validate_skill.py (Layer 1)
+
+```python
+# tests/validate_skill.py
+"""
+SKILL.md Named Block 검증 — py_compile + 필수 패턴 체크
+"""
+import re
+import sys
+import py_compile
+import tempfile
+from pathlib import Path
+
+SKILL_MD = Path(__file__).parent.parent / "skill" / "SKILL.md"
+
+REQUIRED_PATTERNS: dict[str, list[str]] = {
+    "pipeline.py": [
+        "from embedding import embed_query",
+        "from reranker import rerank",
+        "from crag import evaluate_retrieval",
+        "from storage import ChunkStore",
+    ],
+    "embedding.py": ["from chunking import Chunk"],
+    "storage.py": ["from chunking import Chunk"],
+    "config.py": ['voyage_api_key: str = ""'],
+    "crag.py": ["class Verdict"],
+}
+
+
+def extract_named_blocks(skill_path: Path) -> dict[str, str]:
+    text = skill_path.read_text(encoding="utf-8")
+    raw_blocks = re.findall(r"```python\n(.*?)```", text, re.DOTALL)
+    blocks = {}
+    for block in raw_blocks:
+        first_line = block.split("\n")[0].strip()
+        match = re.match(r"^#\s+([\w]+\.py)", first_line)
+        if match:
+            name = match.group(1)
+            if name not in blocks:
+                blocks[name] = block
+    return blocks
+
+
+def check_syntax(name: str, code: str) -> list[str]:
+    errors = []
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write(code)
+        tmp_path = f.name
+    try:
+        py_compile.compile(tmp_path, doraise=True)
+    except py_compile.PyCompileError as e:
+        errors.append(f"SyntaxError in {name}: {e}")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    return errors
+
+
+def check_required_patterns(name: str, code: str) -> list[str]:
+    warnings = []
+    patterns = REQUIRED_PATTERNS.get(name, [])
+    for pattern in patterns:
+        if pattern not in code:
+            warnings.append(f"WARN [{name}]: missing '{pattern}'")
+    return warnings
+
+
+def main() -> int:
+    blocks = extract_named_blocks(SKILL_MD)
+    all_errors, all_warnings = [], []
+
+    for name, code in blocks.items():
+        all_errors.extend(check_syntax(name, code))
+        all_warnings.extend(check_required_patterns(name, code))
+
+    for w in all_warnings:
+        print(w)
+    for e in all_errors:
+        print(e, file=sys.stderr)
+
+    print(f"\n{len(all_errors)} errors, {len(all_warnings)} warnings — {'PASS' if not all_errors else 'FAIL'}")
+    return 0 if not all_errors else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### GitHub Actions CI
+
+```yaml
+# .github/workflows/ci.yml
+name: RAG Skill CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  validate-skill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tests/validate_skill.py
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run unit tests with coverage
+        run: pytest tests/unit/ -v --cov=. --cov-report=xml --cov-fail-under=60
+```
+
+### requirements-dev.txt
+
+```
+pytest>=8.0,<9.0
+pytest-cov>=5.0,<6.0
+```
+
+### 실행 명령
+
+```bash
+# SKILL.md 검증
+python tests/validate_skill.py
+
+# 단위 테스트 (coverage 포함)
+pytest tests/unit/ -v --cov=. --cov-fail-under=60
+
+# 특정 모듈만
+pytest tests/unit/test_crag.py -v
 ```
 
 ---
