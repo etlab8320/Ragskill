@@ -8,14 +8,14 @@ Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 ## 설치
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.1.0/install.sh | bash
 ```
 
 또는 수동 설치:
 
 ```bash
 mkdir -p ~/.claude/skills/rag-pipeline
-curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/main/skill/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.1.0/skill/SKILL.md \
   -o ~/.claude/skills/rag-pipeline/SKILL.md
 ```
 
@@ -38,7 +38,8 @@ Claude Code에서:
 
 | 레이어 | 컴포넌트 | 스펙 |
 |--------|----------|------|
-| 임베딩 | **Voyage `voyage-4-large`** | MoE, Matryoshka (256~2048dim), 32K 컨텍스트, 다국어 |
+| 임베딩 (일반) | **Voyage `voyage-4-large`** | MoE, Matryoshka (256~2048dim), 32K 컨텍스트, 다국어 |
+| 임베딩 (장문) | **Voyage `voyage-context-3`** | 500p+ 문서, Cross-chunk context 보존, Late Chunking 네이티브 지원 |
 | 리랭킹 | **Voyage `rerank-2`** | Cross-encoder |
 | 벡터 DB | **pgvector + pgvectorscale** | 50M 벡터에서 471 QPS |
 | 키워드 | **PostgreSQL tsvector** | 같은 DB, 추가 인프라 없음 |
@@ -198,14 +199,17 @@ export RAG_LLM_MODE=claude-api   # Claude API (Agentic 필요 시)
 
 스킬 파일에 바로 사용 가능한 Python 코드가 포함되어 있습니다:
 
-- `llm.py` — LLM 추상화 레이어 (API/CLI 자동 전환)
-- `chunking.py` — 시맨틱 청킹 (오버랩)
+- `exceptions.py` — 커스텀 예외 계층 (RagError → LLMError → RateLimitError 등)
+- `config.py` — pydantic BaseSettings 중앙 설정 (env var 통합 관리)
+- `llm.py` — LLM 추상화 레이어 (API/CLI 자동 전환, tenacity 재시도)
+- `chunking.py` — 시맨틱 청킹 + Late Chunking (voyage-context-3)
 - `enrichment.py` — 맥락 강화 (Anthropic 방식)
-- `embedding.py` — Voyage 4 임베딩 (배치, Matryoshka)
-- `storage.py` — pgvector 하이브리드 저장/검색 (RRF SQL)
+- `embedding.py` — Voyage 4 임베딩 (배치, Matryoshka, Rate-limit 재시도)
+- `storage.py` — pgvector 하이브리드 저장/검색 (RRF SQL, psycopg3 ConnectionPool)
 - `reranker.py` — Voyage rerank-2
-- `crag.py` — CRAG 자가 수정
-- `pipeline.py` — 풀 쿼리 파이프라인
+- `crag.py` — CRAG 자가 수정 (JSON 구조화 응답 + Verdict enum)
+- `pipeline.py` — 풀 쿼리 파이프라인 (QueryRequest 입력 검증 + 인젝션 방어)
+- `ingest.py` — 인제스션 스크립트 3종 (Small/Medium/Large 규모별)
 - `agentic_rag.py` — 에이전틱 RAG (Claude tool_use)
 - `evaluation.py` — RAGAS 평가
 - `monitoring.py` — Langfuse 모니터링
