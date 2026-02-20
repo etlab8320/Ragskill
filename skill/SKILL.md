@@ -111,7 +111,26 @@ options:
     description: "코드 특화 청킹 + 구조 보존"
 ```
 
-### Phase 3: Self-correction 수준
+### Phase 3: LLM 선택
+
+```yaml
+question: "답변 생성 / CRAG 검증 / 맥락 강화에 사용할 LLM은?"
+header: "LLM"
+options:
+  - label: "Claude API (Recommended)"
+    description: "ANTHROPIC_API_KEY 필요. 가장 안정적, tool_use 지원"
+  - label: "Claude CLI"
+    description: "API 키 불필요. Claude Code 플랜만 있으면 됨. 개발/프로토타입용"
+  - label: "Gemini Flash"
+    description: "GEMINI_API_KEY 필요. 가장 저렴하고 빠름. 비용 최적화"
+  - label: "OpenAI"
+    description: "OPENAI_API_KEY 필요. GPT-4o-mini 등 범용"
+```
+
+> **Note**: 임베딩/리랭킹은 항상 Voyage입니다. 여기서 선택하는 건 LLM(맥락 강화, CRAG 판단, 답변 생성)만 해당됩니다.
+> Agentic RAG를 사용하려면 tool_use가 필요하므로 Claude API / Gemini / OpenAI 중 선택해야 합니다 (CLI 불가).
+
+### Phase 4: Self-correction 수준
 
 ```yaml
 question: "답변 신뢰도 검증 수준은?"
@@ -124,7 +143,7 @@ options:
   - label: "Self-RAG — 검색 필요성까지 판단"
     description: "검색 없이 답할 수 있으면 직접 답변. 효율 최적화"
   - label: "Agentic — 에이전트가 전체 제어"
-    description: "가장 정확. 멀티스텝 검색, 자가 평가, 재검색"
+    description: "가장 정확. 멀티스텝 검색, 자가 평가, 재검색. tool_use 필요 (CLI 불가)"
 ```
 
 ---
