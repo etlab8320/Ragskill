@@ -1,6 +1,7 @@
 # RAG Pipeline Skill for Claude Code
 
 > 30+ 기법/논문/벤치마크 리서치 기반의 프로덕션 RAG 파이프라인 구축 스킬
+> 68개 유닛 테스트 + validate_skill.py 검증 완료 (v1.2.0)
 
 Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 "RAG 만들어줘" 같은 요청을 하면 규모 판단 → 전략 선택 → 코드 생성까지 자동으로 가이드합니다.
@@ -8,14 +9,14 @@ Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 ## 설치
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.1.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/main/install.sh | bash
 ```
 
 또는 수동 설치:
 
 ```bash
 mkdir -p ~/.claude/skills/rag-pipeline
-curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.1.0/skill/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/main/skill/SKILL.md \
   -o ~/.claude/skills/rag-pipeline/SKILL.md
 ```
 
@@ -44,7 +45,7 @@ Claude Code에서:
 | 벡터 DB | **pgvector + pgvectorscale** | 50M 벡터에서 471 QPS |
 | 키워드 | **PostgreSQL tsvector** | 같은 DB, 추가 인프라 없음 |
 | LLM | **Any (Claude / Gemini / OpenAI)** | 생성 + 맥락 강화, 원하는 LLM 선택 가능 |
-| 평가 | **RAGAS** | Faithfulness, Precision, Recall |
+| 평가 | **RAGAS 0.4+** | Gemini/OpenAI/Claude 지원, OpenAI 키 불필요 |
 | 모니터링 | **Langfuse** (오픈소스) | 프로덕션 관측성 |
 
 ## 일반 RAG vs 이 스킬의 차이
@@ -112,7 +113,7 @@ Claude Code에서:
      → 하이브리드 검색 (시맨틱 + 키워드, RRF 융합)
      → Voyage rerank-2 리랭킹
      → CRAG 검증 (CORRECT/AMBIGUOUS/INCORRECT)
-     → 원문 기반 Claude 답변 생성
+     → 원문 기반 LLM 답변 생성
 ```
 
 ## 지원하는 RAG 아키텍처 (10종)
@@ -126,6 +127,84 @@ Claude Code에서:
 | **Corrective RAG** | 검색 품질 검증 + 웹 폴백 | 높은 신뢰도 |
 | Self-RAG | 모델이 검색 필요 여부 판단 | 효율 최적화 |
 | Multimodal RAG | ColPali (이미지/표/차트) | PDF, 인포그래픽 |
+
+## 포함된 코드 템플릿
+
+스킬 파일에 바로 사용 가능한 프로덕션 Python 코드가 포함되어 있습니다:
+
+| 파일 | 설명 |
+|------|------|
+| `exceptions.py` | 커스텀 예외 계층 (RagError → LLMError → RateLimitError 등) |
+| `config.py` | pydantic BaseSettings 중앙 설정 (`.env` 자동 로드) |
+| `llm.py` | Multi-LLM 추상화 (Gemini / Claude / OpenAI / CLI 자동 전환, tenacity 재시도) |
+| `chunking.py` | 시맨틱 청킹 + Late Chunking (`voyage-context-3`) |
+| `enrichment.py` | 맥락 강화 (Anthropic Contextual Retrieval 방식) |
+| `embedding.py` | Voyage 4 임베딩 (배치 처리, Rate-limit 재시도, bge-m3 로컬 폴백) |
+| `storage.py` | pgvector 하이브리드 저장/검색 (RRF SQL, psycopg3 ConnectionPool) |
+| `reranker.py` | Voyage rerank-2 Cross-encoder |
+| `crag.py` | CRAG 자가 수정 (JSON 구조화 응답 + Verdict enum + DuckDuckGo 웹 폴백) |
+| `pipeline.py` | 풀 쿼리 파이프라인 (입력 검증 + 프롬프트 인젝션 방어) |
+| `ingest.py` | 인제스션 3종 (Small / Medium / Large 규모별) |
+| `agentic_rag.py` | 에이전틱 RAG (tool_use 기반 자율 검색) |
+| `evaluation.py` | RAGAS 0.4+ 평가 (Gemini/OpenAI/Claude 지원) |
+| `monitoring.py` | Langfuse 분산 추적 |
+| `schema.sql` | pgvector 테이블 + HNSW/GIN 인덱스 |
+
+## API 키
+
+| 키 | 발급처 | 비용 | 용도 |
+|----|--------|------|------|
+| `VOYAGE_API_KEY` | [dash.voyageai.com](https://dash.voyageai.com/) | 무료 50M 토큰/월 | 임베딩 + 리랭킹 (필수) |
+| `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/) | 무료 티어 있음 | LLM (기본값, 추천) |
+| `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/) | 사용량 기반 | LLM (Agentic RAG 필요 시) |
+| `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/) | 사용량 기반 | LLM (범용) |
+
+- `VOYAGE_API_KEY` 없으면 로컬 `bge-m3` 모델로 자동 폴백됩니다.
+- **Claude CLI가 설치되어 있으면 LLM API 키 없이 `claude-cli` 모드로 사용 가능합니다.**
+- LLM 키가 하나라도 있으면 바로 시작 가능합니다.
+
+## LLM 모드 선택 (Multi-LLM)
+
+`RAG_LLM_MODE` 환경변수로 LLM 제공자를 선택합니다:
+
+```bash
+export RAG_LLM_MODE=gemini       # Gemini Flash (기본값, 가장 저렴)
+export GEMINI_API_KEY=AI...
+
+export RAG_LLM_MODE=claude-cli   # Claude CLI (API 키 불필요)
+
+export RAG_LLM_MODE=openai       # OpenAI GPT-4o-mini 등
+export OPENAI_API_KEY=sk-...
+
+export RAG_LLM_MODE=claude-api   # Claude API (Agentic RAG 필요 시)
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+> **왜 Gemini Flash가 기본값인가?** RAG에서 LLM은 맥락 강화(한 줄 요약), CRAG 검증(분류), 답변 생성(읽고 요약) 같은 단순 작업만 합니다. 이런 작업에서 모델 간 품질 차이는 거의 없고, 비용 차이만 큽니다.
+
+| 항목 | **Gemini Flash (기본)** | Claude CLI | OpenAI | Claude API |
+|------|------------------------|-----------|--------|-----------|
+| 비용 | **가장 저렴** | 플랜 포함 | 사용량 과금 | 사용량 과금 |
+| 속도 | **가장 빠름** | 느림 | 빠름 | 빠름 |
+| tool_use | 지원 | 미지원 | 지원 | 지원 |
+| Agentic RAG | 가능 | 불가 | 가능 | 가능 |
+| 추천 | **일반 용도** | API 키 없을 때 | 범용 | Agentic 필요 시 |
+
+## 사용자가 할 일 vs Claude Code가 할 일
+
+| 작업 | Claude Code 자동 | 사용자 |
+|------|:----------------:|:------:|
+| 프로젝트 구조 생성 | ✅ | |
+| Docker (PostgreSQL + pgvector) 세팅 + 실행 | ✅ | |
+| DB 스키마 생성 | ✅ | |
+| 파이프라인 코드 전체 생성 | ✅ | |
+| `.env` 파일 생성 + API 키 설정 | ✅ | |
+| 인제스션 스크립트 생성 + 실행 | ✅ | |
+| 챗봇 API 서버 생성 | ✅ | |
+| **PDF 파일 준비** | | ✅ |
+| **Voyage API 키 발급** ([무료 가입](https://dash.voyageai.com/)) | | ✅ |
+
+> **사용자는 PDF 파일 + Voyage API 키만 준비하면 됩니다.** 나머지는 전부 Claude Code가 자동으로 생성하고 실행합니다.
 
 ## 핵심 원칙
 
@@ -148,72 +227,57 @@ Claude Code에서:
 | int8 양자화 | 4x 메모리 절감, 96% 성능 |
 | Graph RAG | 포괄성 **72-83% 향상** |
 
-## 사용자가 할 일 vs Claude Code가 할 일
+## 테스트 & 검증 (v1.2.0)
 
-| 작업 | Claude Code 자동 | 사용자 |
-|------|:----------------:|:------:|
-| 프로젝트 구조 생성 | ✅ | |
-| Docker (PostgreSQL + pgvector) 세팅 + 실행 | ✅ | |
-| DB 스키마 생성 | ✅ | |
-| 파이프라인 코드 전체 생성 | ✅ | |
-| `.env` 파일 생성 + API 키 설정 | ✅ | |
-| 인제스션 스크립트 생성 + 실행 | ✅ | |
-| 챗봇 API 서버 생성 | ✅ | |
-| **PDF 파일 준비** | | ✅ |
-| **Voyage API 키 발급** ([무료 가입](https://dash.voyageai.com/)) | | ✅ |
-
-> **사용자는 PDF 파일 + Voyage API 키만 준비하면 됩니다.** 나머지는 전부 Claude Code가 자동으로 생성하고 실행합니다.
-
-## API 키
-
-| 키 | 발급처 | 비용 |
-|----|--------|------|
-| `VOYAGE_API_KEY` | [dash.voyageai.com](https://dash.voyageai.com/) | 무료 50M 토큰/월 |
-| `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/) | 사용량 기반 |
-
-- API 키가 없어도 로컬 모델(bge-m3)로 폴백 가능합니다.
-- **Claude CLI가 설치되어 있으면 `ANTHROPIC_API_KEY` 없이 CLI 모드로 사용 가능합니다.**
-
-## LLM 모드 선택 (Multi-LLM)
-
-`RAG_LLM_MODE` 환경변수로 LLM 제공자를 선택합니다:
+이 스킬은 SKILL.md 자체를 검증하는 테스트 인프라를 포함합니다.
 
 ```bash
-export RAG_LLM_MODE=gemini       # Gemini Flash (기본값, 가장 저렴)
-export RAG_LLM_MODE=claude-cli   # Claude CLI (API 키 불필요)
-export RAG_LLM_MODE=openai       # OpenAI
-export RAG_LLM_MODE=claude-api   # Claude API (Agentic 필요 시)
+cd tests/
+
+# 1. SKILL.md 코드 블록 추출 + 문법 검증
+python validate_skill.py
+
+# 2. 유닛 테스트 전체 실행 (68개)
+pytest -v --cov=. --cov-report=term-missing
+
+# 커버리지 보고서 HTML
+pytest --cov=. --cov-report=html
 ```
 
-> **왜 Gemini Flash가 기본값인가?** RAG에서 LLM은 맥락 강화(한 줄 요약), CRAG 검증(분류), 답변 생성(읽고 요약) 같은 단순 작업만 합니다. 이런 작업에서 모델 간 품질 차이는 거의 없고, 비용 차이만 큽니다.
+**테스트 현황:**
 
-| 항목 | **Gemini Flash (기본)** | Claude CLI | OpenAI | Claude API |
-|------|------------------------|-----------|--------|-----------|
-| 비용 | **가장 저렴** | 플랜 포함 | 사용량 과금 | 사용량 과금 |
-| 속도 | **가장 빠름** | 느림 | 빠름 | 빠름 |
-| tool_use | 지원 | 미지원 | 지원 | 지원 |
-| Agentic RAG | 가능 | 불가 | 가능 | 가능 |
-| 추천 | **일반 용도** | API 키 없을 때 | 범용 | Agentic 필요 시 |
+| 모듈 | 테스트 수 | 커버리지 |
+|------|----------|---------|
+| `test_chunking.py` | 12 | `chunking.py` |
+| `test_embedding.py` | 10 | `embedding.py` |
+| `test_enrichment.py` | 8 | `enrichment.py` |
+| `test_storage.py` | 10 | `storage.py` |
+| `test_crag.py` | 14 | `crag.py` |
+| `test_pipeline.py` | 14 | `pipeline.py` |
+| **합계** | **68** | **97%** |
 
-## 포함된 코드 템플릿
+`validate_skill.py`는 SKILL.md의 모든 Python 코드 블록을 자동 추출해 문법 검사합니다. CI에서 자동 실행됩니다.
 
-스킬 파일에 바로 사용 가능한 Python 코드가 포함되어 있습니다:
+## 변경 이력
 
-- `exceptions.py` — 커스텀 예외 계층 (RagError → LLMError → RateLimitError 등)
-- `config.py` — pydantic BaseSettings 중앙 설정 (env var 통합 관리)
-- `llm.py` — LLM 추상화 레이어 (API/CLI 자동 전환, tenacity 재시도)
-- `chunking.py` — 시맨틱 청킹 + Late Chunking (voyage-context-3)
-- `enrichment.py` — 맥락 강화 (Anthropic 방식)
-- `embedding.py` — Voyage 4 임베딩 (배치, Matryoshka, Rate-limit 재시도)
-- `storage.py` — pgvector 하이브리드 저장/검색 (RRF SQL, psycopg3 ConnectionPool)
-- `reranker.py` — Voyage rerank-2
-- `crag.py` — CRAG 자가 수정 (JSON 구조화 응답 + Verdict enum)
-- `pipeline.py` — 풀 쿼리 파이프라인 (QueryRequest 입력 검증 + 인젝션 방어)
-- `ingest.py` — 인제스션 스크립트 3종 (Small/Medium/Large 규모별)
-- `agentic_rag.py` — 에이전틱 RAG (Claude tool_use)
-- `evaluation.py` — RAGAS 평가
-- `monitoring.py` — Langfuse 모니터링
-- `schema.sql` — pgvector 테이블 + 인덱스
+### v1.2.0 (2026-02-20)
+- **테스트 인프라 추가**: 68개 유닛 테스트, `validate_skill.py`, GitHub Actions CI
+- **BUG-02 수정**: `google.generativeai` (deprecated) → `google.genai>=1.0.0` 신규 SDK
+- **RAGAS 0.4+ 지원**: `EvaluationDataset` + `SingleTurnSample` 신규 API, Gemini/OpenAI/Claude 지원
+- **requirements 업데이트**: `google-genai>=1.0.0`, `ragas>=0.4.0`, `langchain-google-genai>=2.0`
+- **BUG-01 수정**: `storage.py`의 `from chunking import Chunk` import 누락 추가
+
+### v1.1.0
+- Multi-LLM 지원 (Gemini / Claude CLI / OpenAI / Claude API)
+- CRAG JSON 구조화 응답 + Verdict enum
+- psycopg3 + ConnectionPool (psycopg2 대체)
+- tenacity 재시도 로직 전면 적용
+- pydantic BaseSettings 설정 중앙화
+- Late Chunking (`voyage-context-3`) 추가
+- 프롬프트 인젝션 방어 (`pipeline.py`)
+
+### v1.0.0
+- 초기 릴리즈: Advanced RAG + CRAG + Hybrid Search 기본 구조
 
 ## 참고 자료
 
