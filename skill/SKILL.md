@@ -17,7 +17,7 @@ Build production-grade RAG systems based on comprehensive research across 30+ te
 | Reranking | **Voyage `rerank-2`** | Cross-encoder reranking |
 | Vector DB | **pgvector + pgvectorscale** | 471 QPS at 50M vectors (10x faster than Qdrant) |
 | Keyword Search | **PostgreSQL tsvector** | Same DB, no extra infra |
-| LLM | **Claude API** | Generation + context enrichment |
+| LLM | **Claude (API or CLI)** | Generation + context enrichment |
 | Evaluation | **RAGAS** | Faithfulness, precision, recall |
 | Monitoring | **Langfuse** (open-source) | Production observability |
 
@@ -63,6 +63,8 @@ for env_file in [".env", ".env.local"]:
 4. If **ANTHROPIC_API_KEY missing**:
    - Display: "Claude API 키가 필요합니다 (contextual enrichment + generation용)."
    - Guide: "https://console.anthropic.com/ → API Keys"
+   - **Alternative**: "Claude CLI가 설치되어 있으면 API 키 없이 CLI 모드로 사용 가능합니다."
+   - CLI 모드 설정: `export RAG_LLM_MODE=cli`
 5. If both present → proceed to Question Flow
 
 **Fallback stack (API 키 없을 때):**
@@ -201,16 +203,57 @@ def semantic_chunk(text: str, source: str, max_tokens: int = 512) -> list[Chunk]
     return chunks
 ```
 
-### Step 2: Contextual Enrichment
+### Step 2: LLM Wrapper (API or CLI)
+
+Voyage handles embedding/reranking only. LLM (enrichment, CRAG, generation) is separate — use **Claude API** or **Claude CLI**, your choice.
+
+```python
+# llm.py — LLM abstraction layer
+import os
+import subprocess
+
+MODE = os.environ.get("RAG_LLM_MODE", "api")  # "api" or "cli"
+
+if MODE == "api":
+    import anthropic
+    _client = anthropic.Anthropic()
+
+def llm(prompt: str, model: str = "claude-haiku-4-5-20251001", max_tokens: int = 300) -> str:
+    """Call Claude via API or CLI."""
+    if MODE == "api":
+        resp = _client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text
+    else:
+        # Claude CLI — no API key needed if already authenticated
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", model],
+            capture_output=True, text=True, timeout=60
+        )
+        return result.stdout.strip()
+```
+
+**선택 기준:**
+
+| | Claude API | Claude CLI |
+|--|-----------|-----------|
+| 속도 | 빠름 (직접 호출) | 약간 느림 (프로세스 스폰) |
+| 인증 | ANTHROPIC_API_KEY 필요 | `claude` 로그인만 되어있으면 됨 |
+| 비용 | API 사용량 과금 | CLI 플랜에 포함 |
+| 배치 처리 | 병렬 가능 | 순차 권장 |
+| 프로덕션 | 권장 | 개발/프로토타입에 적합 |
+
+### Step 3: Contextual Enrichment
 
 Anthropic's method: prepend context description to each chunk before embedding.
 **Reduces retrieval failure by 67%.**
 
 ```python
 # enrichment.py
-import anthropic
-
-client = anthropic.Anthropic()
+from llm import llm
 
 CONTEXT_PROMPT = """<document>
 {document}
@@ -231,25 +274,18 @@ SUMMARY_PROMPT = """Summarize in 1-2 sentences focused on searchable facts and e
 
 def enrich_chunk(full_doc: str, chunk: Chunk) -> Chunk:
     """Add context + search summary to chunk."""
-    # Context generation
-    ctx_resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{"role": "user", "content": CONTEXT_PROMPT.format(document=full_doc, chunk=chunk.content)}]
+    chunk.context = llm(
+        CONTEXT_PROMPT.format(document=full_doc, chunk=chunk.content),
+        max_tokens=200
     )
-    chunk.context = ctx_resp.content[0].text
-
-    # Summary for search (search on summaries, deliver originals)
-    sum_resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=100,
-        messages=[{"role": "user", "content": SUMMARY_PROMPT.format(chunk=chunk.content)}]
+    chunk.summary = llm(
+        SUMMARY_PROMPT.format(chunk=chunk.content),
+        max_tokens=100
     )
-    chunk.summary = sum_resp.content[0].text
     return chunk
 ```
 
-### Step 3: Embedding with Voyage 4
+### Step 4: Embedding with Voyage 4
 
 ```python
 # embedding.py
@@ -293,7 +329,7 @@ def embed_query(query: str) -> list[float]:
 - `output_dtype="int8"` → 4x 메모리 절감, 96% 성능 유지
 - `output_dtype="binary"` → 32x 압축, 92-96% 성능 유지
 
-### Step 4: Storage (pgvector + Hybrid Index)
+### Step 5: Storage (pgvector + Hybrid Index)
 
 ```sql
 -- schema.sql
@@ -377,7 +413,7 @@ class ChunkStore:
 
 ## QUERY PIPELINE
 
-### Step 5: Reranking with Voyage rerank-2
+### Step 6: Reranking with Voyage rerank-2
 
 ```python
 # reranker.py
@@ -399,7 +435,7 @@ def rerank(query: str, chunks: list[dict], top_k: int = 5) -> list[dict]:
     return [chunks[r.index] for r in result.results]
 ```
 
-### Step 6: Self-Correction (CRAG Pattern)
+### Step 7: Self-Correction (CRAG Pattern)
 
 ```python
 # crag.py
@@ -407,6 +443,7 @@ def rerank(query: str, chunks: list[dict], top_k: int = 5) -> list[dict]:
 Corrective RAG: evaluate retrieval quality before generation.
 5 poisoned documents can manipulate 90% of responses — validation is essential.
 """
+from llm import llm
 
 EVAL_PROMPT = """Query: {query}
 
@@ -421,14 +458,10 @@ def evaluate_retrieval(query: str, chunks: list[dict]) -> tuple[list[dict], str]
     correct, ambiguous = [], []
 
     for chunk in chunks:
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=10,
-            messages=[{"role": "user", "content": EVAL_PROMPT.format(
-                query=query, document=chunk['content'][:1000]
-            )}]
-        )
-        verdict = resp.content[0].text.strip().upper()
+        verdict = llm(
+            EVAL_PROMPT.format(query=query, document=chunk['content'][:1000]),
+            max_tokens=10
+        ).strip().upper()
 
         if verdict == "CORRECT":
             correct.append(chunk)
@@ -445,15 +478,17 @@ def evaluate_retrieval(query: str, chunks: list[dict]) -> tuple[list[dict], str]
         return [], "incorrect"
 ```
 
-### Step 7: Full Query Pipeline
+### Step 8: Full Query Pipeline
 
 ```python
 # pipeline.py
-import anthropic
-import voyageai
+from llm import llm
 
-anthropic_client = anthropic.Anthropic()
-vo = voyageai.Client()
+SYSTEM_PROMPT = (
+    "Answer based on the provided context. "
+    "Cite sources using [Source: filename] format. "
+    "If the context doesn't contain enough information, say so clearly."
+)
 
 def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = True) -> dict:
     """Complete RAG query pipeline."""
@@ -482,20 +517,15 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
         for c in final_chunks
     ])
 
-    # 6. Generate with Claude
-    response = anthropic_client.messages.create(
+    # 6. Generate with Claude (API or CLI)
+    answer = llm(
+        f"{SYSTEM_PROMPT}\n\nContext:\n{context}\n\nQuestion: {user_query}",
         model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=(
-            "Answer based on the provided context. "
-            "Cite sources using [Source: filename] format. "
-            "If the context doesn't contain enough information, say so clearly."
-        ),
-        messages=[{"role": "user", "content": f"Context:\n{context}\n\nQuestion: {user_query}"}]
+        max_tokens=4096
     )
 
     return {
-        "answer": response.content[0].text,
+        "answer": answer,
         "sources": [c['metadata'] for c in final_chunks],
         "status": "success",
         "chunks_used": len(final_chunks)
@@ -508,9 +538,14 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
 
 ### Agentic RAG (for complex queries)
 
+> **Note:** Agentic RAG uses Claude tool_use, so requires **API mode** (`RAG_LLM_MODE=api`).
+> CLI mode doesn't support tool_use natively.
+
 ```python
 # agentic_rag.py
-"""Agent-driven retrieval: plan → search → validate → re-search if needed."""
+"""Agent-driven retrieval: plan → search → validate → re-search if needed. (API mode only)"""
+import anthropic
+anthropic_client = anthropic.Anthropic()
 
 TOOLS = [
     {
