@@ -31,9 +31,8 @@ fi
 
 # Check: Claude Code CLI
 if ! command -v claude &>/dev/null; then
-    error "Claude Code CLI not found."
-    error "Install from https://docs.anthropic.com/en/docs/claude-code"
-    exit 1
+    warn "Claude Code CLI not found — skill file will be installed, but requires Claude Code to run."
+    warn "Install from https://docs.anthropic.com/en/docs/claude-code"
 fi
 
 # Check: existing installation

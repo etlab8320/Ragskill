@@ -140,7 +140,7 @@ options:
   - label: "Basic — Reranking만"
     description: "빠르고 저렴. 대부분 충분"
   - label: "CRAG — 검색 품질 자동 평가"
-    description: "검색 결과가 나쁘면 자동 폐기 + 웹 검색 폴백"
+    description: "검색 결과가 나쁘면 자동 폐기 + DuckDuckGo 웹 검색 폴백 (무료, 키 불필요)"
   - label: "Self-RAG — 검색 필요성까지 판단"
     description: "검색 없이 답할 수 있으면 직접 답변. 효율 최적화"
   - label: "Agentic — 에이전트가 전체 제어"
@@ -201,7 +201,7 @@ class CRAGError(RagError):
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    voyage_api_key: str
+    voyage_api_key: str = ""          # "" = bge-m3 로컬 폴백 사용
     database_url: str = "postgresql://rag:ragpass@localhost:5432/ragdb"
     rag_llm_mode: str = "gemini"
     gemini_api_key: str = ""
@@ -523,18 +523,34 @@ def enrich_chunk(full_doc: str, chunk: Chunk) -> Chunk:
 ### Step 4: Embedding with Voyage 4
 
 ```python
-# embedding.py — with rate limit retry
+# embedding.py — with rate limit retry + bge-m3 fallback
 import logging
 import voyageai
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, before_sleep_log
 from exceptions import EmbeddingError, RateLimitError
 from config import settings
+from chunking import Chunk       # Chunk 타입 참조
 
 logger = logging.getLogger(__name__)
-vo = voyageai.Client(api_key=settings.voyage_api_key)
+
+# Voyage 키 없으면 로컬 bge-m3 폴백
+if settings.voyage_api_key:
+    vo = voyageai.Client(api_key=settings.voyage_api_key)
+    _USE_LOCAL = False
+else:
+    from sentence_transformers import SentenceTransformer as _ST
+    _local_model = _ST("BAAI/bge-m3")
+    _USE_LOCAL = True
+    logger.warning("VOYAGE_API_KEY not set — using local bge-m3 (slower, no reranking)")
 
 def _embed_batch_raw(texts: list[str], input_type: str, dimension: int) -> list[list[float]]:
-    """Inner call with rate-limit retry (max 5 attempts, exponential backoff up to 2 min)."""
+    """Inner call with rate-limit retry (max 5 attempts, exponential backoff up to 2 min).
+    Falls back to local bge-m3 if VOYAGE_API_KEY is not set."""
+    if _USE_LOCAL:
+        # bge-m3 폴백: dimension 무시 (1024 고정), input_type 미지원
+        embeddings = _local_model.encode(texts, normalize_embeddings=True)
+        return [e.tolist() for e in embeddings]
+
     @retry(
         wait=wait_exponential(multiplier=2, min=2, max=120),
         stop=stop_after_attempt(5),
@@ -843,10 +859,39 @@ def evaluate_retrieval(query: str, chunks: list[dict]) -> tuple[list[dict], str]
 # pipeline.py — with input validation + prompt injection defense
 import re
 import logging
+import requests
 from pydantic import BaseModel, field_validator
 from llm import llm
+from embedding import embed_query
+from reranker import rerank
+from crag import evaluate_retrieval
+from storage import ChunkStore
 from exceptions import ValidationError
 from config import settings
+
+def _web_search_fallback(query: str, top_k: int = 5) -> list[dict]:
+    """CRAG 웹 폴백: DuckDuckGo API (무료, 키 불필요).
+    CRAG 논문 원본 동작 — 내부 검색 실패 시 웹으로 보완."""
+    try:
+        resp = requests.get(
+            "https://api.duckduckgo.com/",
+            params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+            timeout=5,
+        )
+        data = resp.json()
+        results = []
+        for item in data.get("RelatedTopics", [])[:top_k]:
+            if isinstance(item, dict) and item.get("Text"):
+                results.append({
+                    "content": item["Text"],
+                    "context": "",
+                    "summary": item["Text"][:200],
+                    "metadata": {"source": "web", "url": item.get("FirstURL", "")},
+                })
+        return results
+    except Exception as e:
+        logger.warning(f"Web search fallback failed: {e}")
+        return []
 
 logger = logging.getLogger(__name__)
 
@@ -901,8 +946,14 @@ def query(user_query: str, store: "ChunkStore", top_k: int = 5, use_crag: bool =
     if req.use_crag:
         validated, status = evaluate_retrieval(req.query, reranked)
         if status == "incorrect":
-            return {"answer": "관련 문서를 찾지 못했습니다.", "sources": [], "status": "no_results"}
-        final_chunks = validated[:req.top_k]
+            # Web search fallback (CRAG paper 원본 동작)
+            web_chunks = _web_search_fallback(req.query, top_k=req.top_k)
+            if web_chunks:
+                final_chunks = web_chunks
+            else:
+                return {"answer": "관련 문서를 찾지 못했습니다.", "sources": [], "status": "no_results"}
+        else:
+            final_chunks = validated[:req.top_k]
     else:
         final_chunks = reranked[:req.top_k]
 
