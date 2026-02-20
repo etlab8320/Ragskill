@@ -17,8 +17,8 @@
 - **파일**: `llm.py` 블록 (`_call_gemini` 함수)
 - **증상**: `import google.generativeai as genai` → `DeprecationWarning` 또는 `ImportError` (신규 설치 시)
 - **원인**: google.generativeai는 deprecated. 신규 SDK는 `from google import genai; genai.Client()` 방식
-- **수정**: 실제 구현 시 `from google import genai` + `types.GenerateContentConfig` 사용 필요
-- **참고**: SKILL.md 코드 예시는 구버전 기준 — 사용자가 실제 설치 시 충돌 가능
+- **수정**: `from google import genai; genai.Client(api_key=...)` + `types.GenerateContentConfig` ✅ FIXED
+- **requirements**: `google-generativeai` → `google-genai>=1.0.0` ✅ FIXED
 
 ---
 
