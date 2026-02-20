@@ -1095,38 +1095,137 @@ Query → ColPali search → Vision LLM generates answer
 ```python
 # evaluation.py
 """
-RAG evaluation with RAGAS framework.
-Install: pip install ragas
-"""
-from ragas import evaluate
-from ragas.metrics import faithfulness, context_precision, context_recall, answer_relevancy
-from datasets import Dataset
+RAG evaluation with RAGAS 0.4+ framework.
 
-def evaluate_rag(questions: list, answers: list, contexts: list, ground_truths: list) -> dict:
-    """Evaluate RAG pipeline with RAGAS metrics."""
-    dataset = Dataset.from_dict({
-        "question": questions,
-        "answer": answers,
-        "contexts": contexts,          # list of list of strings
-        "ground_truth": ground_truths
-    })
+Install:
+    pip install ragas langchain-google-genai   # Gemini (기본값, 가장 저렴)
+    pip install ragas langchain-openai         # OpenAI
+    pip install ragas langchain-anthropic      # Anthropic
+
+LLM 선택은 RAG_LLM_MODE 환경변수 따름 (llm.py와 동일).
+OPENAI_API_KEY 없어도 GEMINI_API_KEY로 실행 가능.
+"""
+import os
+from ragas import evaluate, EvaluationDataset
+from ragas.dataset_schema import SingleTurnSample
+from ragas.metrics.collections import faithfulness, context_precision, context_recall, answer_relevancy
+from ragas.llms import LangchainLLMWrapper
+from config import settings
+
+
+def _get_ragas_llm():
+    """RAG_LLM_MODE에 따라 RAGAS용 LLM 반환."""
+    mode = settings.rag_llm_mode
+
+    if mode == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        model = os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
+        return LangchainLLMWrapper(
+            ChatGoogleGenerativeAI(model=model, google_api_key=settings.gemini_api_key)
+        )
+    elif mode == "openai":
+        from langchain_openai import ChatOpenAI
+        model = os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini")
+        return LangchainLLMWrapper(ChatOpenAI(model=model))
+    elif mode == "claude-api":
+        from langchain_anthropic import ChatAnthropic
+        model = os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")
+        return LangchainLLMWrapper(
+            ChatAnthropic(model=model, api_key=settings.anthropic_api_key)
+        )
+    else:
+        raise ValueError(
+            f"RAG_LLM_MODE='{mode}' is not supported for RAGAS evaluation. "
+            "Use 'gemini', 'openai', or 'claude-api'."
+        )
+
+
+def evaluate_rag(
+    questions: list[str],
+    answers: list[str],
+    contexts: list[list[str]],
+    ground_truths: list[str],
+) -> dict:
+    """RAGAS로 RAG 파이프라인 품질 평가.
+
+    Args:
+        questions: 질문 목록
+        answers: RAG가 생성한 답변 목록
+        contexts: 각 질문에 대해 검색된 청크 텍스트 목록 (list of list)
+        ground_truths: 정답 (골든 데이터셋)
+
+    Returns:
+        dict with faithfulness, context_precision, context_recall, answer_relevancy scores
+    """
+    samples = [
+        SingleTurnSample(
+            user_input=q,
+            response=a,
+            retrieved_contexts=ctx,
+            reference=gt,
+        )
+        for q, a, ctx, gt in zip(questions, answers, contexts, ground_truths)
+    ]
+    dataset = EvaluationDataset(samples=samples)
+    llm = _get_ragas_llm()
 
     result = evaluate(
-        dataset,
-        metrics=[faithfulness, context_precision, context_recall, answer_relevancy]
+        dataset=dataset,
+        metrics=[faithfulness, context_precision, context_recall, answer_relevancy],
+        llm=llm,
     )
     return result
 
-# Target scores:
-# Faithfulness > 0.9 (answers grounded in context)
-# Context Precision > 0.8 (retrieved docs are relevant)
-# Context Recall > 0.8 (found all needed info)
-# Answer Relevancy > 0.85 (answers match questions)
+
+# ──────────────────────────────────────────────
+# 사용 예시 (evaluate.py 직접 실행)
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    # 골든 데이터셋 예시 (실제론 50~100개 필요)
+    sample_questions = [
+        "What are the cardiovascular benefits of exercise?",
+        "How does HIIT affect VO2max?",
+    ]
+    sample_answers = [
+        "Exercise improves heart efficiency and reduces cardiovascular disease risk.",
+        "HIIT significantly increases VO2max by 10-20% over 8-12 weeks.",
+    ]
+    sample_contexts = [
+        ["Exercise strengthens the heart muscle and improves circulation."],
+        ["High-intensity interval training has been shown to improve aerobic capacity."],
+    ]
+    sample_ground_truths = [
+        "Regular exercise improves cardiovascular health.",
+        "HIIT improves VO2max effectively.",
+    ]
+
+    scores = evaluate_rag(sample_questions, sample_answers, sample_contexts, sample_ground_truths)
+    print(scores)
 ```
+
+**목표 점수:**
+| 메트릭 | 목표 | 의미 |
+|--------|------|------|
+| Faithfulness | > 0.9 | 답변이 컨텍스트에 근거함 |
+| Context Precision | > 0.8 | 검색된 문서가 관련 있음 |
+| Context Recall | > 0.8 | 필요한 정보를 전부 찾음 |
+| Answer Relevancy | > 0.85 | 질문에 맞는 답변 |
 
 ### Golden Dataset
 
-Build 50-100 question-answer-source triplets for your domain. This is the single most important investment for RAG quality.
+도메인별 질문-정답-출처 triplet 50~100개를 만들어야 한다. RAG 품질 투자 중 단일로 가장 효과 좋음.
+
+```bash
+# 골든 데이터셋 생성 예시 (수동 또는 LLM으로 생성)
+# golden_dataset.json
+[
+  {
+    "question": "VO2max를 높이는 가장 효과적인 훈련법은?",
+    "ground_truth": "HIIT(고강도 인터벌 트레이닝)가 8~12주 내 VO2max를 10~20% 향상시킴",
+    "source": "sports_physiology.pdf"
+  }
+]
+```
 
 ---
 
@@ -1220,7 +1319,10 @@ pydantic>=2.5,<3.0
 pydantic-settings>=2.0,<3.0     # BaseSettings + .env support
 tenacity>=8.2,<10.0             # Retry with exponential backoff
 fastapi>=0.115.0,<1.0
-ragas>=0.2.0,<1.0
+ragas>=0.4.0,<1.0
+langchain-google-genai>=2.0,<3.0  # RAGAS + RAG_LLM_MODE=gemini (GEMINI_API_KEY)
+# langchain-openai>=0.2,<1.0      # RAG_LLM_MODE=openai (OPENAI_API_KEY)
+# langchain-anthropic>=0.3,<1.0   # RAG_LLM_MODE=claude-api (ANTHROPIC_API_KEY)
 langfuse>=2.0,<4.0
 datasets>=3.0,<4.0
 # Multi-LLM (install as needed based on RAG_LLM_MODE)
