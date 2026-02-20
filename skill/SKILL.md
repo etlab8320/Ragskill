@@ -117,14 +117,14 @@ options:
 question: "답변 생성 / CRAG 검증 / 맥락 강화에 사용할 LLM은?"
 header: "LLM"
 options:
-  - label: "Claude API (Recommended)"
-    description: "ANTHROPIC_API_KEY 필요. 가장 안정적, tool_use 지원"
+  - label: "Gemini Flash (Recommended)"
+    description: "GEMINI_API_KEY 필요. 가장 저렴하고 빠름. RAG의 LLM 작업은 단순해서 충분"
   - label: "Claude CLI"
-    description: "API 키 불필요. Claude Code 플랜만 있으면 됨. 개발/프로토타입용"
-  - label: "Gemini Flash"
-    description: "GEMINI_API_KEY 필요. 가장 저렴하고 빠름. 비용 최적화"
+    description: "API 키 불필요. Claude Code 플랜만 있으면 됨"
   - label: "OpenAI"
     description: "OPENAI_API_KEY 필요. GPT-4o-mini 등 범용"
+  - label: "Claude API"
+    description: "ANTHROPIC_API_KEY 필요. tool_use 지원. Agentic RAG 필요 시"
 ```
 
 > **Note**: 임베딩/리랭킹은 항상 Voyage입니다. 여기서 선택하는 건 LLM(맥락 강화, CRAG 판단, 답변 생성)만 해당됩니다.
@@ -233,8 +233,8 @@ Voyage handles embedding/reranking only. LLM (enrichment, CRAG, generation) is s
 import os
 import subprocess
 
-MODE = os.environ.get("RAG_LLM_MODE", "claude-api")
-# Supported: "claude-api", "claude-cli", "gemini", "openai"
+MODE = os.environ.get("RAG_LLM_MODE", "gemini")
+# Supported: "gemini", "claude-cli", "openai", "claude-api"
 
 def llm(prompt: str, max_tokens: int = 300) -> str:
     """Call LLM via configured provider."""
@@ -280,33 +280,33 @@ def llm(prompt: str, max_tokens: int = 300) -> str:
 **설정 예시:**
 
 ```bash
-# Claude API (기본값)
-export RAG_LLM_MODE=claude-api
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Claude CLI (API 키 불필요)
-export RAG_LLM_MODE=claude-cli
-
-# Gemini Flash (가장 저렴)
+# Gemini Flash (기본값, 가장 저렴하고 빠름 — RAG LLM 작업에 충분)
 export RAG_LLM_MODE=gemini
 export GEMINI_API_KEY=AI...
-export RAG_LLM_MODEL=gemini-2.0-flash  # optional
+
+# Claude CLI (API 키 불필요, 플랜만 있으면 됨)
+export RAG_LLM_MODE=claude-cli
 
 # OpenAI
 export RAG_LLM_MODE=openai
 export OPENAI_API_KEY=sk-...
-export RAG_LLM_MODEL=gpt-4o-mini  # optional
+
+# Claude API (Agentic RAG 등 tool_use 필요 시)
+export RAG_LLM_MODE=claude-api
+export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 **선택 기준:**
 
-| | Claude API | Claude CLI | Gemini Flash | OpenAI |
-|--|-----------|-----------|-------------|--------|
-| 비용 | 사용량 과금 | 플랜 포함 | **가장 저렴** | 사용량 과금 |
-| 속도 | 빠름 | 느림 | **가장 빠름** | 빠름 |
+> **왜 Gemini Flash가 기본값인가?** RAG에서 LLM은 맥락 강화(한 줄 요약), CRAG 검증(분류), 답변 생성(읽고 요약) 같은 단순 작업만 합니다. 이런 작업에서 모델 간 품질 차이는 거의 없고, 비용 차이만 큽니다.
+
+| | **Gemini Flash (기본)** | Claude CLI | OpenAI | Claude API |
+|--|------------------------|-----------|--------|-----------|
+| 비용 | **가장 저렴** | 플랜 포함 | 사용량 과금 | 사용량 과금 |
+| 속도 | **가장 빠름** | 느림 | 빠름 | 빠름 |
 | tool_use | 지원 | 미지원 | 지원 | 지원 |
 | Agentic RAG | 가능 | 불가 | 가능 | 가능 |
-| 프로덕션 | 권장 | 개발용 | 비용 최적 | 범용 |
+| 추천 | **일반 용도** | API 키 없을 때 | 범용 | Agentic 필요 시 |
 
 ### Step 3: Contextual Enrichment
 

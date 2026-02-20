@@ -161,19 +161,21 @@ Claude Code에서:
 `RAG_LLM_MODE` 환경변수로 LLM 제공자를 선택합니다:
 
 ```bash
-export RAG_LLM_MODE=claude-api   # Claude API (기본값)
+export RAG_LLM_MODE=gemini       # Gemini Flash (기본값, 가장 저렴)
 export RAG_LLM_MODE=claude-cli   # Claude CLI (API 키 불필요)
-export RAG_LLM_MODE=gemini       # Gemini Flash (가장 저렴)
 export RAG_LLM_MODE=openai       # OpenAI
+export RAG_LLM_MODE=claude-api   # Claude API (Agentic 필요 시)
 ```
 
-| 항목 | Claude API | Claude CLI | Gemini Flash | OpenAI |
-|------|-----------|-----------|-------------|--------|
-| 비용 | 사용량 과금 | 플랜 포함 | **가장 저렴** | 사용량 과금 |
-| 속도 | 빠름 | 느림 | **가장 빠름** | 빠름 |
+> **왜 Gemini Flash가 기본값인가?** RAG에서 LLM은 맥락 강화(한 줄 요약), CRAG 검증(분류), 답변 생성(읽고 요약) 같은 단순 작업만 합니다. 이런 작업에서 모델 간 품질 차이는 거의 없고, 비용 차이만 큽니다.
+
+| 항목 | **Gemini Flash (기본)** | Claude CLI | OpenAI | Claude API |
+|------|------------------------|-----------|--------|-----------|
+| 비용 | **가장 저렴** | 플랜 포함 | 사용량 과금 | 사용량 과금 |
+| 속도 | **가장 빠름** | 느림 | 빠름 | 빠름 |
 | tool_use | 지원 | 미지원 | 지원 | 지원 |
 | Agentic RAG | 가능 | 불가 | 가능 | 가능 |
-| 프로덕션 | 권장 | 개발용 | 비용 최적 | 범용 |
+| 추천 | **일반 용도** | API 키 없을 때 | 범용 | Agentic 필요 시 |
 
 ## 포함된 코드 템플릿
 
