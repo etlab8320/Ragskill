@@ -839,6 +839,25 @@ datasets>=3.0
 | Multi-turn conversation | RAG (keeps prompts lean) |
 | Real-time data | RAG |
 
+## Automation — Claude Code가 자동으로 하는 것
+
+이 스킬을 사용하면 Claude Code가 아래를 **전부 자동 생성 + 실행**합니다:
+
+| 작업 | Claude Code 자동 | 사용자 |
+|------|:----------------:|:------:|
+| 프로젝트 구조 생성 | ✅ | |
+| `docker-compose.yml` (PostgreSQL + pgvector) | ✅ | |
+| `docker compose up -d` 실행 | ✅ | |
+| DB 스키마 생성 (`schema.sql` 실행) | ✅ | |
+| 파이프라인 코드 전체 생성 | ✅ | |
+| `.env` 파일 생성 + API 키 설정 | ✅ | |
+| `ingest.py` 생성 + 인제스션 실행 | ✅ | |
+| 챗봇 API 서버 생성 (`app.py`) | ✅ | |
+| PDF 파일 준비 | | ✅ |
+| Voyage API 키 발급 (무료 가입) | | ✅ |
+
+**사용자는 PDF 파일 + Voyage API 키만 준비하면 됩니다.** 나머지는 전부 자동.
+
 ## Key Principles
 
 1. **Hybrid search is mandatory** — BM25 only: 0.72 recall → Hybrid: 0.91 recall
