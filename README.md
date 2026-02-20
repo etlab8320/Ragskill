@@ -27,11 +27,12 @@ Claude Code에서:
 /rag-pipeline
 ```
 
-자동으로 3단계 질문을 통해 최적 전략을 선택합니다:
+자동으로 4단계 질문을 통해 최적 전략을 선택합니다:
 
 1. **규모** — Small (< 50p) / Medium (50-500p) / Large (500p+)
 2. **문서 유형** — 내부문서, 법률, PDF/이미지, 코드
-3. **검증 수준** — Basic / CRAG / Self-RAG / Agentic
+3. **LLM 선택** — Gemini Flash (기본) / Claude CLI / OpenAI / Claude API
+4. **검증 수준** — Basic / CRAG / Self-RAG / Agentic
 
 ## 핵심 스택
 

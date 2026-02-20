@@ -236,13 +236,13 @@ import subprocess
 MODE = os.environ.get("RAG_LLM_MODE", "gemini")
 # Supported: "gemini", "claude-cli", "openai", "claude-api"
 
-def llm(prompt: str, max_tokens: int = 300) -> str:
-    """Call LLM via configured provider."""
+def llm(prompt: str, max_tokens: int = 300, model: str | None = None) -> str:
+    """Call LLM via configured provider. model overrides RAG_LLM_MODEL env var."""
 
     if MODE == "claude-api":
         import anthropic
         resp = anthropic.Anthropic().messages.create(
-            model=os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001"),
+            model=model or os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001"),
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -251,7 +251,7 @@ def llm(prompt: str, max_tokens: int = 300) -> str:
     elif MODE == "claude-cli":
         result = subprocess.run(
             ["claude", "-p", prompt, "--model",
-             os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")],
+             model or os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")],
             capture_output=True, text=True, timeout=60
         )
         return result.stdout.strip()
@@ -259,15 +259,15 @@ def llm(prompt: str, max_tokens: int = 300) -> str:
     elif MODE == "gemini":
         import google.generativeai as genai
         genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        model = genai.GenerativeModel(
-            os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
+        gmodel = genai.GenerativeModel(
+            model or os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
         )
-        return model.generate_content(prompt).text
+        return gmodel.generate_content(prompt).text
 
     elif MODE == "openai":
         from openai import OpenAI
         resp = OpenAI().chat.completions.create(
-            model=os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"),
+            model=model or os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"),
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -275,6 +275,30 @@ def llm(prompt: str, max_tokens: int = 300) -> str:
 
     else:
         raise ValueError(f"Unknown RAG_LLM_MODE: {MODE}")
+
+
+def get_api_client():
+    """Return (client, model_name, provider) for tool_use capable providers."""
+    if MODE == "claude-api":
+        import anthropic
+        return (
+            anthropic.Anthropic(),
+            os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001"),
+            "anthropic",
+        )
+    elif MODE == "gemini":
+        import google.generativeai as genai
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+        model_name = os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
+        return genai.GenerativeModel(model_name), model_name, "gemini"
+    elif MODE == "openai":
+        from openai import OpenAI
+        return OpenAI(), os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"), "openai"
+    else:
+        raise ValueError(
+            "Agentic RAG requires tool_use. "
+            "Set RAG_LLM_MODE to claude-api, gemini, or openai."
+        )
 ```
 
 **설정 예시:**
@@ -390,6 +414,29 @@ def embed_query(query: str) -> list[float]:
 - `output_dimension=512` → 절반 크기, ~97% 성능 유지 (Matryoshka)
 - `output_dtype="int8"` → 4x 메모리 절감, 96% 성능 유지
 - `output_dtype="binary"` → 32x 압축, 92-96% 성능 유지
+
+### Docker Setup (PostgreSQL + pgvector)
+
+```yaml
+# docker-compose.yml — Claude Code가 자동 생성하는 템플릿
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: ragdb
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+volumes:
+  pgdata:
+```
+
+> `docker compose up -d` 실행 후 아래 `schema.sql`이 자동 적용됩니다.
 
 ### Step 5: Storage (pgvector + Hybrid Index)
 
@@ -582,7 +629,6 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
     # 6. Generate with Claude (API or CLI)
     answer = llm(
         f"{SYSTEM_PROMPT}\n\nContext:\n{context}\n\nQuestion: {user_query}",
-        model="claude-sonnet-4-20250514",
         max_tokens=4096
     )
 
@@ -600,14 +646,17 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
 
 ### Agentic RAG (for complex queries)
 
-> **Note:** Agentic RAG uses Claude tool_use, so requires **API mode** (`RAG_LLM_MODE=api`).
-> CLI mode doesn't support tool_use natively.
+> **Note:** Agentic RAG requires tool_use, so set `RAG_LLM_MODE` to `claude-api`, `gemini`, or `openai`.
+> CLI mode (`claude-cli`) does not support tool_use.
 
 ```python
 # agentic_rag.py
-"""Agent-driven retrieval: plan → search → validate → re-search if needed. (API mode only)"""
-import anthropic
-anthropic_client = anthropic.Anthropic()
+"""Agent-driven retrieval: plan → search → validate → re-search if needed.
+Requires API mode (RAG_LLM_MODE=claude-api, gemini, or openai).
+Implementation below uses Anthropic Messages API; adapt for other providers.
+"""
+from llm import get_api_client
+client, model_name, provider = get_api_client()
 
 TOOLS = [
     {
@@ -645,8 +694,8 @@ def agentic_query(user_query: str, store: ChunkStore) -> str:
     messages = [{"role": "user", "content": user_query}]
 
     for _ in range(5):  # Max turns
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = client.messages.create(
+            model=model_name,
             max_tokens=4096,
             system=AGENT_SYSTEM,
             tools=TOOLS,
@@ -749,6 +798,9 @@ Build 50-100 question-answer-source triplets for your domain. This is the single
 ```python
 # monitoring.py
 from langfuse import Langfuse
+from embedding import embed_query
+from reranker import rerank
+from llm import llm
 
 langfuse = Langfuse()
 
@@ -757,21 +809,23 @@ def traced_query(user_query: str, store: ChunkStore) -> dict:
 
     # Track retrieval
     retrieval_span = trace.span(name="hybrid-search")
-    candidates = store.hybrid_search(...)
+    query_emb = embed_query(user_query)
+    candidates = store.hybrid_search(query_emb, user_query, top_k=20)
     retrieval_span.end(output={"count": len(candidates)})
 
     # Track reranking
     rerank_span = trace.span(name="rerank")
-    reranked = rerank(...)
+    reranked = rerank(user_query, candidates, top_k=5)
     rerank_span.end(output={"count": len(reranked)})
 
     # Track generation
     gen_span = trace.span(name="generation")
-    answer = ...
-    gen_span.end(output={"tokens": ...})
+    context = "\n\n---\n\n".join([c['content'][:500] for c in reranked])
+    answer = llm(f"Context:\n{context}\n\nQuestion: {user_query}", max_tokens=4096)
+    gen_span.end(output={"answer_length": len(answer)})
 
     trace.update(output=answer)
-    return answer
+    return {"answer": answer, "sources": [c['metadata'] for c in reranked]}
 ```
 
 ### Security
@@ -826,6 +880,9 @@ fastapi>=0.115.0
 ragas>=0.2.0
 langfuse>=2.0
 datasets>=3.0
+# Multi-LLM support (install as needed based on RAG_LLM_MODE)
+google-generativeai>=0.8.0  # RAG_LLM_MODE=gemini
+openai>=1.50.0              # RAG_LLM_MODE=openai
 ```
 
 ## RAG vs Long Context Decision
