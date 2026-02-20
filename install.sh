@@ -1,9 +1,9 @@
 #!/bin/bash
 # RAG Pipeline Skill Installer for Claude Code
-# Usage: curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.0.0/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/etlab8320/Ragskill/v1.1.0/install.sh | bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 REPO="etlab8320/Ragskill"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/v${VERSION}"
 SKILL_DIR="$HOME/.claude/skills/rag-pipeline"

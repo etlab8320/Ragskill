@@ -13,7 +13,8 @@ Build production-grade RAG systems based on comprehensive research across 30+ te
 
 | Layer | Component | Spec |
 |-------|-----------|------|
-| Embedding | **Voyage `voyage-4-large`** | 1024dim, MoE, Matryoshka, 32K context, multilingual |
+| Embedding | **Voyage `voyage-4-large`** (Small/Medium) | 1024dim, MoE, Matryoshka, 32K context, multilingual |
+| Embedding (Large docs) | **Voyage `voyage-context-3`** | 긴 문서 청크에 문서 전체 맥락 자동 주입. `/v1/contextualizedembeddings` API |
 | Reranking | **Voyage `rerank-2`** | Cross-encoder reranking |
 | Vector DB | **pgvector + pgvectorscale** | 471 QPS at 50M vectors (10x faster than Qdrant) |
 | Keyword Search | **PostgreSQL tsvector** | Same DB, no extra infra |
@@ -169,6 +170,57 @@ options:
 
 ## INGESTION PIPELINE
 
+### Step 0: Foundation Modules (항상 먼저 생성)
+
+```python
+# exceptions.py — 커스텀 예외 계층
+class RagError(Exception):
+    """Base exception for all RAG pipeline errors."""
+
+class LLMError(RagError):
+    """LLM API call failed."""
+
+class RateLimitError(LLMError):
+    """429 Rate Limit exceeded — retriable."""
+
+class EmbeddingError(RagError):
+    """Embedding API call failed."""
+
+class StorageError(RagError):
+    """Database connection or query failed."""
+
+class ValidationError(RagError):
+    """Input validation failed."""
+
+class CRAGError(RagError):
+    """CRAG validation logic failed."""
+```
+
+```python
+# config.py — 환경변수 중앙 관리 (pydantic-settings)
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    voyage_api_key: str
+    database_url: str = "postgresql://rag:ragpass@localhost:5432/ragdb"
+    rag_llm_mode: str = "gemini"
+    gemini_api_key: str = ""
+    openai_api_key: str = ""
+    anthropic_api_key: str = ""
+
+    llm_max_retries: int = 3
+    llm_retry_min_wait: float = 1.0
+    llm_retry_max_wait: float = 60.0
+    llm_timeout: int = 120
+    db_pool_min: int = 2
+    db_pool_max: int = 10
+    max_query_length: int = 2000
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
+settings = Settings()
+```
+
 ### Step 1: Chunking Strategy
 
 **Benchmark results:**
@@ -222,6 +274,54 @@ def semantic_chunk(text: str, source: str, max_tokens: int = 512) -> list[Chunk]
             metadata={"source": source, "chunk_index": len(chunks)}
         ))
     return chunks
+
+
+def late_chunk(
+    text: str,
+    source: str,
+    vo: "voyageai.Client",
+    max_tokens: int = 512,
+    use_late_chunking: bool = False,
+) -> list[Chunk]:
+    """
+    Late Chunking via voyage-context-3 (500p+ 긴 문서 전용).
+
+    voyage-context-3는 청크 리스트를 한 번에 처리해 각 청크에
+    문서 전체 맥락을 자동 주입합니다. Late Chunking 논문 방식의
+    Voyage 공식 구현체입니다. Jina-v3 late chunking 대비 +23.66%.
+
+    use_late_chunking=False (기본값) → semantic_chunk()로 폴백
+    use_late_chunking=True → voyage-context-3 사용 (Large 규모 권장)
+
+    Reference:
+      - https://arxiv.org/pdf/2409.04701 (Late Chunking paper)
+      - https://docs.voyageai.com/docs/contextualized-chunk-embeddings
+    """
+    if not use_late_chunking:
+        return semantic_chunk(text, source, max_tokens)
+
+    # 1. 텍스트를 청크로 분리
+    raw_chunks = semantic_chunk(text, source, max_tokens)
+    if not raw_chunks:
+        return []
+
+    chunk_texts = [c.content for c in raw_chunks]
+
+    # 2. voyage-context-3로 문서 전체 맥락을 보존한 임베딩
+    #    inputs는 List[List[str]] — 같은 문서의 청크를 inner list로 묶음
+    result = vo.embed_chunks(
+        chunks=[chunk_texts],           # 이 문서의 모든 청크를 하나의 그룹으로
+        model="voyage-context-3",
+        input_type="document",
+        output_dimension=1024,
+    )
+
+    # 3. 임베딩을 Chunk 객체에 주입
+    for i, chunk in enumerate(raw_chunks):
+        chunk.embedding = result.embeddings[0][i]   # [문서0][청크i]
+        chunk.metadata["method"] = "voyage-context-3"
+
+    return raw_chunks
 ```
 
 ### Step 2: LLM Wrapper (API or CLI)
@@ -229,52 +329,101 @@ def semantic_chunk(text: str, source: str, max_tokens: int = 512) -> list[Chunk]
 Voyage handles embedding/reranking only. LLM (enrichment, CRAG, generation) is separate — choose any provider.
 
 ```python
-# llm.py — Multi-LLM abstraction layer
+# llm.py — Multi-LLM abstraction layer with retry
 import os
+import logging
 import subprocess
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, before_sleep_log
+from exceptions import LLMError, RateLimitError
+from config import settings
 
-MODE = os.environ.get("RAG_LLM_MODE", "gemini")
-# Supported: "gemini", "claude-cli", "openai", "claude-api"
+logger = logging.getLogger(__name__)
+MODE = settings.rag_llm_mode
 
-def llm(prompt: str, max_tokens: int = 300, model: str | None = None) -> str:
-    """Call LLM via configured provider. model overrides RAG_LLM_MODEL env var."""
+def _retry_config(exc_types: tuple):
+    return dict(
+        wait=wait_exponential(
+            multiplier=1,
+            min=settings.llm_retry_min_wait,
+            max=settings.llm_retry_max_wait,
+        ),
+        stop=stop_after_attempt(settings.llm_max_retries),
+        retry=retry_if_exception_type(exc_types),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
 
-    if MODE == "claude-api":
-        import anthropic
+@retry(**_retry_config((LLMError, RateLimitError)))
+def _call_claude_api(prompt: str, max_tokens: int, model: str) -> str:
+    import anthropic
+    try:
         resp = anthropic.Anthropic().messages.create(
-            model=model or os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001"),
+            model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.content[0].text
+    except anthropic.RateLimitError as e:
+        raise RateLimitError(str(e)) from e
+    except anthropic.APIError as e:
+        raise LLMError(str(e)) from e
 
-    elif MODE == "claude-cli":
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--model",
-             model or os.environ.get("RAG_LLM_MODEL", "claude-haiku-4-5-20251001")],
-            capture_output=True, text=True, timeout=60
+@retry(**_retry_config((LLMError,)))
+def _call_claude_cli(prompt: str, max_tokens: int, model: str) -> str:
+    result = subprocess.run(
+        ["claude", "--print", prompt, "--model", model],
+        capture_output=True, text=True,
+        timeout=settings.llm_timeout,
+    )
+    if result.returncode != 0:
+        raise LLMError(f"claude CLI failed (rc={result.returncode}): {result.stderr[:200]}")
+    return result.stdout.strip()
+
+@retry(**_retry_config((LLMError, RateLimitError)))
+def _call_gemini(prompt: str, max_tokens: int, model: str) -> str:
+    import google.generativeai as genai
+    genai.configure(api_key=settings.gemini_api_key)
+    try:
+        gmodel = genai.GenerativeModel(model)
+        resp = gmodel.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(max_output_tokens=max_tokens),
         )
-        return result.stdout.strip()
+        return resp.text
+    except Exception as e:
+        if "429" in str(e) or "RATE_LIMIT" in str(e).upper():
+            raise RateLimitError(str(e)) from e
+        raise LLMError(str(e)) from e
 
-    elif MODE == "gemini":
-        import google.generativeai as genai
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        gmodel = genai.GenerativeModel(
-            model or os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
-        )
-        return gmodel.generate_content(prompt).text
-
-    elif MODE == "openai":
-        from openai import OpenAI
+@retry(**_retry_config((LLMError, RateLimitError)))
+def _call_openai(prompt: str, max_tokens: int, model: str) -> str:
+    from openai import OpenAI, RateLimitError as OAIRateLimit, APIError
+    try:
         resp = OpenAI().chat.completions.create(
-            model=model or os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"),
+            model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}]
         )
         return resp.choices[0].message.content
+    except OAIRateLimit as e:
+        raise RateLimitError(str(e)) from e
+    except APIError as e:
+        raise LLMError(str(e)) from e
 
-    else:
-        raise ValueError(f"Unknown RAG_LLM_MODE: {MODE}")
+def llm(prompt: str, max_tokens: int = 300, model: str | None = None) -> str:
+    """Call LLM via configured provider. model overrides RAG_LLM_MODEL env var."""
+    _model = model or os.environ.get("RAG_LLM_MODEL", {
+        "claude-api": "claude-haiku-4-5-20251001",
+        "claude-cli": "claude-haiku-4-5-20251001",
+        "gemini":     "gemini-2.0-flash",
+        "openai":     "gpt-4o-mini",
+    }.get(MODE, "gemini-2.0-flash"))
+
+    if MODE == "claude-api":   return _call_claude_api(prompt, max_tokens, _model)
+    if MODE == "claude-cli":   return _call_claude_cli(prompt, max_tokens, _model)
+    if MODE == "gemini":       return _call_gemini(prompt, max_tokens, _model)
+    if MODE == "openai":       return _call_openai(prompt, max_tokens, _model)
+    raise ValueError(f"Unknown RAG_LLM_MODE: {MODE}")
 
 
 def get_api_client():
@@ -290,14 +439,14 @@ def get_api_client():
         import google.generativeai as genai
         genai.configure(api_key=os.environ["GEMINI_API_KEY"])
         model_name = os.environ.get("RAG_LLM_MODEL", "gemini-2.0-flash")
-        return genai.GenerativeModel(model_name), model_name, "gemini"
+        return None, model_name, "gemini"
     elif MODE == "openai":
         from openai import OpenAI
-        return OpenAI(), os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"), "openai"
+        return None, os.environ.get("RAG_LLM_MODEL", "gpt-4o-mini"), "openai"
     else:
         raise ValueError(
             "Agentic RAG requires tool_use. "
-            "Set RAG_LLM_MODE to claude-api, gemini, or openai."
+            "Set RAG_LLM_MODE to claude-api."
         )
 ```
 
@@ -374,40 +523,54 @@ def enrich_chunk(full_doc: str, chunk: Chunk) -> Chunk:
 ### Step 4: Embedding with Voyage 4
 
 ```python
-# embedding.py
+# embedding.py — with rate limit retry
+import logging
 import voyageai
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type, before_sleep_log
+from exceptions import EmbeddingError, RateLimitError
+from config import settings
 
-vo = voyageai.Client()  # VOYAGE_API_KEY env var
+logger = logging.getLogger(__name__)
+vo = voyageai.Client(api_key=settings.voyage_api_key)
+
+def _embed_batch_raw(texts: list[str], input_type: str, dimension: int) -> list[list[float]]:
+    """Inner call with rate-limit retry (max 5 attempts, exponential backoff up to 2 min)."""
+    @retry(
+        wait=wait_exponential(multiplier=2, min=2, max=120),
+        stop=stop_after_attempt(5),
+        retry=retry_if_exception_type((RateLimitError, EmbeddingError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _call():
+        try:
+            result = vo.embed(
+                texts,
+                model="voyage-4-large",
+                input_type=input_type,       # "document" vs "query" — MUST match usage
+                output_dimension=dimension,
+                output_dtype="float",
+            )
+            return result.embeddings
+        except voyageai.error.RateLimitError as e:
+            raise RateLimitError(str(e)) from e
+        except Exception as e:
+            raise EmbeddingError(str(e)) from e
+    return _call()
 
 def embed_chunks(chunks: list[Chunk]) -> list[Chunk]:
-    """Embed chunks using Voyage 4 large. Embed the SUMMARY, not raw content."""
-    # Batch embed summaries (search index)
+    """Embed chunks using Voyage 4 large. Embeds SUMMARY+CONTEXT, not raw content."""
     texts = [f"{c.context}\n{c.summary}" for c in chunks]
-
-    # Voyage supports batching up to 128 texts
-    for i in range(0, len(texts), 128):
+    for i in range(0, len(texts), 128):          # Voyage batch limit: 128
         batch = texts[i:i+128]
-        result = vo.embed(
-            batch,
-            model="voyage-4-large",
-            input_type="document",
-            output_dimension=1024,     # Matryoshka: 256/512/1024/2048
-            output_dtype="float"       # or "int8", "binary" for compression
-        )
-        for j, emb in enumerate(result.embeddings):
+        embeddings = _embed_batch_raw(batch, input_type="document", dimension=1024)
+        for j, emb in enumerate(embeddings):
             chunks[i+j].embedding = emb
-
     return chunks
 
 def embed_query(query: str) -> list[float]:
-    """Embed a search query."""
-    result = vo.embed(
-        [query],
-        model="voyage-4-large",
-        input_type="query",
-        output_dimension=1024
-    )
-    return result.embeddings[0]
+    """Embed a search query. Uses input_type='query' — different from documents."""
+    return _embed_batch_raw([query], input_type="query", dimension=1024)[0]
 ```
 
 **Cost optimization options:**
@@ -469,53 +632,94 @@ CREATE INDEX idx_metadata ON chunks USING gin (metadata);
 ```
 
 ```python
-# storage.py
-import psycopg2
-from pgvector.psycopg2 import register_vector
+# storage.py — psycopg3 + ConnectionPool (replaces psycopg2)
+import json
+import logging
+import psycopg
+from psycopg_pool import ConnectionPool
+from psycopg.rows import dict_row
+from config import settings
+from exceptions import StorageError
+
+logger = logging.getLogger(__name__)
+
+_RRF_SQL = """
+WITH semantic AS (
+    SELECT id, content, context, summary, metadata,
+           ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS rank_s
+    FROM chunks ORDER BY embedding <=> %s::vector LIMIT %s
+),
+keyword AS (
+    SELECT id,
+           ROW_NUMBER() OVER (ORDER BY ts_rank(search_vector, plainto_tsquery('simple', %s)) DESC) AS rank_k
+    FROM chunks
+    WHERE search_vector @@ plainto_tsquery('simple', %s)
+    LIMIT %s
+)
+SELECT s.id, s.content, s.context, s.summary, s.metadata,
+       (1.0/(60+s.rank_s)) + COALESCE(1.0/(60+k.rank_k), 0) AS rrf_score
+FROM semantic s
+LEFT JOIN keyword k ON s.id = k.id
+ORDER BY rrf_score DESC LIMIT %s
+"""
 
 class ChunkStore:
-    def __init__(self, db_url: str):
-        self.conn = psycopg2.connect(db_url)
-        register_vector(self.conn)
+    _pool: ConnectionPool | None = None
 
-    def store(self, chunk: Chunk):
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO chunks (content, context, summary, metadata, embedding)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (chunk.content, chunk.context, chunk.summary,
-                  json.dumps(chunk.metadata), chunk.embedding))
-        self.conn.commit()
+    def __init__(self):
+        if ChunkStore._pool is None:
+            try:
+                ChunkStore._pool = ConnectionPool(
+                    settings.database_url,
+                    min_size=settings.db_pool_min,
+                    max_size=settings.db_pool_max,
+                    open=True,
+                )
+                logger.info("DB connection pool initialized (min=%d max=%d)",
+                            settings.db_pool_min, settings.db_pool_max)
+            except Exception as e:
+                raise StorageError(f"Failed to create connection pool: {e}") from e
+
+    def store(self, chunk: Chunk) -> None:
+        with ChunkStore._pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO chunks (content, context, summary, metadata, embedding) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (chunk.content, chunk.context, chunk.summary,
+                 json.dumps(chunk.metadata), chunk.embedding),
+            )
+
+    def store_batch(self, chunks: list[Chunk]) -> None:
+        """Batch insert — faster than individual store() calls."""
+        with ChunkStore._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO chunks (content, context, summary, metadata, embedding) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    [(c.content, c.context, c.summary,
+                      json.dumps(c.metadata), c.embedding) for c in chunks],
+                )
 
     def hybrid_search(self, query_embedding: list, query_text: str, top_k: int = 20) -> list[dict]:
         """Reciprocal Rank Fusion (RRF) of semantic + keyword search."""
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                WITH semantic AS (
-                    SELECT id, content, context, summary, metadata,
-                           ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS rank_s
-                    FROM chunks
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                ),
-                keyword AS (
-                    SELECT id,
-                           ROW_NUMBER() OVER (ORDER BY ts_rank(search_vector, plainto_tsquery('simple', %s)) DESC) AS rank_k
-                    FROM chunks
-                    WHERE search_vector @@ plainto_tsquery('simple', %s)
-                    LIMIT %s
-                )
-                SELECT s.id, s.content, s.context, s.summary, s.metadata,
-                       (1.0 / (60 + s.rank_s)) + COALESCE(1.0 / (60 + k.rank_k), 0) AS rrf_score
-                FROM semantic s
-                LEFT JOIN keyword k ON s.id = k.id
-                ORDER BY rrf_score DESC
-                LIMIT %s
-            """, (query_embedding, query_embedding, top_k * 2,
-                  query_text, query_text, top_k * 2, top_k))
+        with ChunkStore._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_RRF_SQL, (
+                    query_embedding, query_embedding, top_k * 2,
+                    query_text, query_text, top_k * 2, top_k,
+                ))
+                return cur.fetchall()
 
-            columns = ['id', 'content', 'context', 'summary', 'metadata', 'rrf_score']
-            return [dict(zip(columns, row)) for row in cur.fetchall()]
+    def delete_by_source(self, source: str) -> None:
+        with ChunkStore._pool.connection() as conn:
+            conn.execute("DELETE FROM chunks WHERE metadata->>'source' = %s", (source,))
+
+    @classmethod
+    def close_pool(cls) -> None:
+        if cls._pool:
+            cls._pool.close()
+            cls._pool = None
+            logger.info("DB connection pool closed")
 ```
 
 ---
@@ -554,44 +758,97 @@ Corrective RAG: evaluate retrieval quality before generation.
 """
 from llm import llm
 
-EVAL_PROMPT = """Query: {query}
+import json
+import re
+import logging
+from dataclasses import dataclass
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+class Verdict(str, Enum):
+    CORRECT   = "CORRECT"
+    INCORRECT = "INCORRECT"
+    AMBIGUOUS = "AMBIGUOUS"
+
+@dataclass
+class CRAGResult:
+    verdict: Verdict
+    confidence: float = 0.5
+    reason: str = ""
+
+# JSON-first prompt — more stable than "respond with one word"
+EVAL_PROMPT = """You are a factual relevance evaluator.
+
+Query: {query}
 
 Retrieved document:
+\"\"\"
 {document}
+\"\"\"
 
-Is this document relevant to answering the query?
-Respond with exactly one word: CORRECT, AMBIGUOUS, or INCORRECT."""
+Does this document contain information relevant to the query?
+
+Respond ONLY with valid JSON (no other text):
+{{
+  "verdict": "CORRECT" | "INCORRECT" | "AMBIGUOUS",
+  "confidence": <float 0.0-1.0>,
+  "reason": "<one sentence>"
+}}"""
+
+def _parse_verdict(response: str) -> CRAGResult:
+    """JSON-first parsing with string-match fallback for robustness."""
+    json_match = re.search(r'\{[^{}]+\}', response, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group())
+            return CRAGResult(
+                verdict=Verdict(data["verdict"].upper()),
+                confidence=float(data.get("confidence", 0.5)),
+                reason=data.get("reason", ""),
+            )
+        except (json.JSONDecodeError, KeyError, ValueError):
+            logger.debug("JSON parse failed, falling back to string match")
+
+    # Fallback: keyword matching (backward compatible)
+    upper = response.upper()
+    if "INCORRECT" in upper: return CRAGResult(Verdict.INCORRECT, 0.5)
+    if "AMBIGUOUS" in upper: return CRAGResult(Verdict.AMBIGUOUS, 0.5)
+    return CRAGResult(Verdict.CORRECT, 0.5)
 
 def evaluate_retrieval(query: str, chunks: list[dict]) -> tuple[list[dict], str]:
-    """Evaluate and correct retrieval results."""
+    """Evaluate and correct retrieval results with structured verdicts."""
     correct, ambiguous = [], []
 
     for chunk in chunks:
-        verdict = llm(
+        response = llm(
             EVAL_PROMPT.format(query=query, document=chunk['content'][:1000]),
-            max_tokens=10
-        ).strip().upper()
+            max_tokens=150,
+        )
+        result = _parse_verdict(response)
 
-        if verdict == "CORRECT":
+        if result.verdict == Verdict.CORRECT:
             correct.append(chunk)
-        elif verdict == "AMBIGUOUS":
+        elif result.verdict == Verdict.AMBIGUOUS:
             ambiguous.append(chunk)
 
-    if correct:
-        return correct, "correct"
-    elif ambiguous:
-        # Refine: extract key info only
-        return ambiguous, "ambiguous"
-    else:
-        # All incorrect: fallback to web search or broader retrieval
-        return [], "incorrect"
+    if correct:   return correct, "correct"
+    if ambiguous: return ambiguous, "ambiguous"
+    return [], "incorrect"
 ```
 
 ### Step 8: Full Query Pipeline
 
 ```python
-# pipeline.py
+# pipeline.py — with input validation + prompt injection defense
+import re
+import logging
+from pydantic import BaseModel, field_validator
 from llm import llm
+from exceptions import ValidationError
+from config import settings
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "Answer based on the provided context. "
@@ -599,26 +856,55 @@ SYSTEM_PROMPT = (
     "If the context doesn't contain enough information, say so clearly."
 )
 
-def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = True) -> dict:
-    """Complete RAG query pipeline."""
+# Prompt injection patterns to block
+_INJECTION_PATTERNS = [
+    r'ignore\s+(previous|all|above)',
+    r'forget\s+(everything|all|previous)',
+    r'\bsystem\s*:',
+    r'\bassistant\s*:',
+    r'<\s*(system|assistant|user)\s*>',
+    r'you\s+are\s+now',
+]
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    use_crag: bool = True
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, v: str) -> str:
+        v = v.strip().replace('\x00', '').replace('\r', '')
+        if not v:
+            raise ValueError("Query cannot be empty")
+        if len(v) > settings.max_query_length:
+            raise ValueError(f"Query too long (max {settings.max_query_length} chars)")
+        for pattern in _INJECTION_PATTERNS:
+            if re.search(pattern, v, re.IGNORECASE):
+                raise ValueError(f"Query contains disallowed pattern: {pattern}")
+        return v
+
+def query(user_query: str, store: "ChunkStore", top_k: int = 5, use_crag: bool = True) -> dict:
+    """Complete RAG query pipeline with input validation."""
+    req = QueryRequest(query=user_query, top_k=top_k, use_crag=use_crag)
 
     # 1. Embed query
-    query_emb = embed_query(user_query)
+    query_emb = embed_query(req.query)
 
     # 2. Hybrid search (RRF: semantic + keyword)
-    candidates = store.hybrid_search(query_emb, user_query, top_k=top_k * 3)
+    candidates = store.hybrid_search(query_emb, req.query, top_k=req.top_k * 3)
 
     # 3. Rerank with Voyage rerank-2
-    reranked = rerank(user_query, candidates, top_k=top_k * 2)
+    reranked = rerank(req.query, candidates, top_k=req.top_k * 2)
 
     # 4. CRAG validation (optional but recommended)
-    if use_crag:
-        validated, status = evaluate_retrieval(user_query, reranked)
+    if req.use_crag:
+        validated, status = evaluate_retrieval(req.query, reranked)
         if status == "incorrect":
             return {"answer": "관련 문서를 찾지 못했습니다.", "sources": [], "status": "no_results"}
-        final_chunks = validated[:top_k]
+        final_chunks = validated[:req.top_k]
     else:
-        final_chunks = reranked[:top_k]
+        final_chunks = reranked[:req.top_k]
 
     # 5. Build context from ORIGINAL content (not summaries)
     context = "\n\n---\n\n".join([
@@ -626,10 +912,10 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
         for c in final_chunks
     ])
 
-    # 6. Generate with Claude (API or CLI)
+    # 6. Generate — context and query are structurally separated (injection mitigation)
     answer = llm(
-        f"{SYSTEM_PROMPT}\n\nContext:\n{context}\n\nQuestion: {user_query}",
-        max_tokens=4096
+        f"{SYSTEM_PROMPT}\n\n<context>\n{context}\n</context>\n\n<question>{req.query}</question>",
+        max_tokens=4096,
     )
 
     return {
@@ -646,17 +932,19 @@ def query(user_query: str, store: ChunkStore, top_k: int = 5, use_crag: bool = T
 
 ### Agentic RAG (for complex queries)
 
-> **Note:** Agentic RAG requires tool_use, so set `RAG_LLM_MODE` to `claude-api`, `gemini`, or `openai`.
+> **Note:** Agentic RAG requires Anthropic tool_use today, so set `RAG_LLM_MODE=claude-api`.
 > CLI mode (`claude-cli`) does not support tool_use.
 
 ```python
 # agentic_rag.py
 """Agent-driven retrieval: plan → search → validate → re-search if needed.
-Requires API mode (RAG_LLM_MODE=claude-api, gemini, or openai).
-Implementation below uses Anthropic Messages API; adapt for other providers.
+Requires API mode (RAG_LLM_MODE=claude-api).
+Implementation below uses Anthropic Messages API.
 """
 from llm import get_api_client
 client, model_name, provider = get_api_client()
+if provider != "anthropic":
+    raise NotImplementedError("Agentic RAG currently supports only RAG_LLM_MODE=claude-api in this template.")
 
 TOOLS = [
     {
@@ -871,18 +1159,25 @@ def update_document(doc_path: str, store: ChunkStore):
 
 ```
 # requirements.txt
-anthropic>=0.45.0
-voyageai>=0.3.0
-pgvector>=0.3.0
-psycopg2-binary>=2.9
-pydantic>=2.0
-fastapi>=0.115.0
-ragas>=0.2.0
-langfuse>=2.0
-datasets>=3.0
-# Multi-LLM support (install as needed based on RAG_LLM_MODE)
-google-generativeai>=0.8.0  # RAG_LLM_MODE=gemini
-openai>=1.50.0              # RAG_LLM_MODE=openai
+# Core
+anthropic>=0.45.0,<1.0
+voyageai>=0.3.0,<1.0
+pgvector>=0.3.0,<1.0
+psycopg[binary]>=3.1,<4.0       # psycopg3 (replaces psycopg2)
+psycopg-pool>=3.1,<4.0          # ConnectionPool
+pydantic>=2.5,<3.0
+pydantic-settings>=2.0,<3.0     # BaseSettings + .env support
+tenacity>=8.2,<10.0             # Retry with exponential backoff
+fastapi>=0.115.0,<1.0
+ragas>=0.2.0,<1.0
+langfuse>=2.0,<4.0
+datasets>=3.0,<4.0
+# Multi-LLM (install as needed based on RAG_LLM_MODE)
+google-generativeai>=0.8.0,<1.0  # RAG_LLM_MODE=gemini
+openai>=1.50.0,<2.0              # RAG_LLM_MODE=openai
+# Development / Testing
+pytest>=8.0,<9.0
+pytest-cov>=5.0,<6.0
 ```
 
 ## RAG vs Long Context Decision
@@ -914,6 +1209,152 @@ openai>=1.50.0              # RAG_LLM_MODE=openai
 | Voyage API 키 발급 (무료 가입) | | ✅ |
 
 **사용자는 PDF 파일 + Voyage API 키만 준비하면 됩니다.** 나머지는 전부 자동.
+
+---
+
+## ingest.py 자동 생성 가이드
+
+질문 흐름(Phase 1-4) 완료 후 Claude Code가 선택에 맞는 `ingest.py`를 생성합니다.
+
+### Small 규모 (< 50p)
+
+```python
+# ingest.py — Small: no chunking, direct embedding
+import sys, os
+from pathlib import Path
+from config import settings
+from chunking import semantic_chunk
+from enrichment import enrich_chunk
+from embedding import embed_chunks
+from storage import ChunkStore
+
+def load_document(path: str) -> str:
+    import fitz  # pymupdf
+    doc = fitz.open(path)
+    return "\n\n".join(page.get_text() for page in doc)
+
+def ingest(file_path: str):
+    store = ChunkStore()
+    text = load_document(file_path)
+    chunks = semantic_chunk(text, source=Path(file_path).name, max_tokens=8192)  # large chunks
+    for chunk in chunks:
+        enrich_chunk(text, chunk)
+    embed_chunks(chunks)
+    store.store_batch(chunks)
+    print(f"Ingested {len(chunks)} chunks from {file_path}")
+
+if __name__ == "__main__":
+    for path in sys.argv[1:]:
+        ingest(path)
+    ChunkStore.close_pool()
+```
+
+### Medium 규모 (50-500p)
+
+```python
+# ingest.py — Medium: semantic_chunk + contextual enrichment
+import sys
+from pathlib import Path
+from config import settings
+from chunking import semantic_chunk
+from enrichment import enrich_chunk
+from embedding import embed_chunks
+from storage import ChunkStore
+
+def load_document(path: str) -> str:
+    import fitz
+    doc = fitz.open(path)
+    return "\n\n".join(page.get_text() for page in doc)
+
+def ingest(file_path: str):
+    store = ChunkStore()
+    text = load_document(file_path)
+    chunks = semantic_chunk(text, source=Path(file_path).name)
+    print(f"  Chunked: {len(chunks)} chunks")
+    for i, chunk in enumerate(chunks):
+        enrich_chunk(text, chunk)       # LLM context + summary per chunk
+        if (i + 1) % 10 == 0:
+            print(f"  Enriched {i+1}/{len(chunks)}...")
+    embed_chunks(chunks)
+    store.store_batch(chunks)
+    print(f"  Stored {len(chunks)} chunks")
+
+if __name__ == "__main__":
+    paths = list(sys.argv[1:])
+    if not paths:
+        print("Usage: python ingest.py <file.pdf> [file2.pdf ...]")
+        sys.exit(1)
+    for path in paths:
+        print(f"Ingesting {path}...")
+        ingest(path)
+    ChunkStore.close_pool()
+    print("Done.")
+```
+
+### Large 규모 (500p+)
+
+> **임베딩 모델**: `voyage-context-3` (`/v1/contextualizedembeddings`)
+> 긴 문서는 청크 간 맥락 보존이 필수입니다. voyage-4-large(독립 임베딩)가 아닌
+> voyage-context-3(문서 전체 맥락 자동 주입)를 사용하세요.
+> Jina-v3 late chunking 대비 +23.66% 성능 향상.
+
+```python
+# ingest.py — Large: voyage-context-3 + parallel batch processing
+import sys
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import voyageai
+from chunking import late_chunk
+from enrichment import enrich_chunk
+from storage import ChunkStore
+
+def load_document(path: str) -> str:
+    import fitz
+    return "\n\n".join(page.get_text() for page in fitz.open(path))
+
+def process_file(file_path: str, store: ChunkStore):
+    vo = voyageai.Client()
+    text = load_document(file_path)
+    # use_late_chunking=True → voyage-context-3 사용 (Large 규모 필수)
+    chunks = late_chunk(text, Path(file_path).name, vo, use_late_chunking=True)
+    for chunk in chunks:
+        enrich_chunk(text, chunk)
+    # NOTE: embed_chunks()는 voyage-4-large를 쓰므로 Large에선 호출 불필요
+    # late_chunk()가 이미 voyage-context-3로 임베딩까지 완료함
+    store.store_batch(chunks)
+    return len(chunks)
+
+if __name__ == "__main__":
+    paths = sys.argv[1:]
+    store = ChunkStore()
+    workers = min(4, len(paths))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(process_file, p, store): p for p in paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            count = future.result()
+            print(f"{path}: {count} chunks ingested")
+    ChunkStore.close_pool()
+```
+
+### 실행 순서 (Claude Code가 자동 수행)
+
+```bash
+# 1. 의존성 설치
+pip install -r requirements.txt
+
+# 2. Docker DB 시작
+docker compose up -d
+sleep 3  # DB 초기화 대기
+
+# 3. 문서 인제스션
+python ingest.py ./data/*.pdf
+
+# 4. API 서버 시작
+python app.py  # FastAPI on :8000
+```
+
+---
 
 ## Key Principles
 
