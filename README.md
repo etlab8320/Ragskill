@@ -41,7 +41,7 @@ Claude Code에서:
 | 리랭킹 | **Voyage `rerank-2`** | Cross-encoder |
 | 벡터 DB | **pgvector + pgvectorscale** | 50M 벡터에서 471 QPS |
 | 키워드 | **PostgreSQL tsvector** | 같은 DB, 추가 인프라 없음 |
-| LLM | **Claude API** | 생성 + 맥락 강화 |
+| LLM | **Claude (API or CLI)** | 생성 + 맥락 강화, API 키 없이 CLI 모드 가능 |
 | 평가 | **RAGAS** | Faithfulness, Precision, Recall |
 | 모니터링 | **Langfuse** (오픈소스) | 프로덕션 관측성 |
 
@@ -107,12 +107,31 @@ Claude Code에서:
 | `VOYAGE_API_KEY` | [dash.voyageai.com](https://dash.voyageai.com/) | 무료 50M 토큰/월 |
 | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/) | 사용량 기반 |
 
-API 키가 없어도 로컬 모델(bge-m3)로 폴백 가능합니다.
+- API 키가 없어도 로컬 모델(bge-m3)로 폴백 가능합니다.
+- **Claude CLI가 설치되어 있으면 `ANTHROPIC_API_KEY` 없이 CLI 모드로 사용 가능합니다.**
+
+## LLM 모드 선택 (API vs CLI)
+
+`RAG_LLM_MODE` 환경변수로 LLM 호출 방식을 선택합니다:
+
+```bash
+export RAG_LLM_MODE=api   # Claude API (기본값, 빠름, tool_use 지원)
+export RAG_LLM_MODE=cli   # Claude CLI (API 키 불필요, 플랜만 있으면 됨)
+```
+
+| 항목 | API 모드 | CLI 모드 |
+|------|----------|----------|
+| 필요한 것 | `ANTHROPIC_API_KEY` | Claude Code 설치 + 플랜 |
+| 속도 | 빠름 | 약간 느림 (subprocess) |
+| tool_use | 지원 | 미지원 |
+| Agentic RAG | 가능 | 불가 (API 전용) |
+| 비용 | API 사용량 기반 | 플랜에 포함 |
 
 ## 포함된 코드 템플릿
 
 스킬 파일에 바로 사용 가능한 Python 코드가 포함되어 있습니다:
 
+- `llm.py` — LLM 추상화 레이어 (API/CLI 자동 전환)
 - `chunking.py` — 시맨틱 청킹 (오버랩)
 - `enrichment.py` — 맥락 강화 (Anthropic 방식)
 - `embedding.py` — Voyage 4 임베딩 (배치, Matryoshka)
