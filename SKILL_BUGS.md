@@ -51,9 +51,10 @@
 
 ## 📋 구현 누락 (미구현)
 
-### MISS-01: GraphRAG 실제 구현 코드 없음
-- SKILL.md에 GraphRAG 아키텍처 설명만 있고 실제 코드 없음
-- 향후 추가 시 `graph_rag.py` 블록 필요
+### ~~MISS-01: GraphRAG 실제 구현 코드 없음~~ ✅ FIXED (2026-02-21)
+- `graph_rag.py` 블록 추가: `GraphStore`, `build_graph()`, `summarize_communities()`, `graph_augment()`
+- `schema.sql`에 `graph_nodes`, `graph_edges`, `graph_communities` 테이블 추가
+- BFS connected components 커뮤니티 탐지 + Recursive CTE 그래프 순회 구현
 
 ### MISS-02: ColPali Multimodal RAG 구현 코드 없음
 - 설명만 있고 실제 코드 없음 (ColPali는 외부 라이브러리 의존성 높음)

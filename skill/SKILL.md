@@ -644,6 +644,41 @@ CREATE INDEX idx_search ON chunks USING gin (search_vector);
 
 -- Metadata filtering
 CREATE INDEX idx_metadata ON chunks USING gin (metadata);
+
+-- ── GraphRAG Tables ──────────────────────────────────────────────────────────
+
+CREATE TABLE graph_nodes (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    type TEXT NOT NULL DEFAULT 'CONCEPT',   -- PERSON | ORG | CONCEPT | LOCATION | EVENT
+    description TEXT DEFAULT '',
+    community_id INTEGER,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE graph_edges (
+    id SERIAL PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    target_id INTEGER NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    relation TEXT NOT NULL,
+    weight FLOAT DEFAULT 1.0,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (source_id, target_id, relation)
+);
+
+CREATE TABLE graph_communities (
+    id INTEGER PRIMARY KEY,
+    summary TEXT,
+    node_ids INTEGER[],
+    metadata JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_graph_nodes_name ON graph_nodes (name);
+CREATE INDEX idx_graph_nodes_community ON graph_nodes (community_id);
+CREATE INDEX idx_graph_edges_source ON graph_edges (source_id);
+CREATE INDEX idx_graph_edges_target ON graph_edges (target_id);
 ```
 
 ```python
@@ -1069,14 +1104,466 @@ def agentic_query(user_query: str, store: ChunkStore) -> str:
 
 ### Graph RAG (for multi-hop reasoning)
 
-Use Microsoft's GraphRAG or build lightweight version:
 ```
-Documents → Entity extraction → Knowledge graph (PostgreSQL recursive CTE or Neo4j)
-Query → Entity recognition → Graph traversal → Related chunks → LLM
+Documents → Entity extraction (LLM) → Knowledge graph (PostgreSQL)
+         → Community detection (BFS connected components)
+         → Community summaries (LLM)
+Query → Entity recognition → Recursive CTE traversal → Augmented context → LLM
 ```
-- Comprehensiveness: 72-83% improvement over standard RAG
-- Diversity: 62-82% improvement
-- **Trade-off**: High build cost, complex maintenance. Use only when multi-hop reasoning is critical.
+- Comprehensiveness: **72-83% improvement** over standard RAG
+- Diversity: **62-82% improvement**
+- Use when: org charts, legal docs, research papers with cross-references
+- **Requires**: GraphRAG tables in schema.sql (graph_nodes, graph_edges, graph_communities)
+
+```python
+# graph_rag.py
+"""
+GraphRAG: PostgreSQL-backed knowledge graph for multi-hop reasoning.
+
+Pipeline:
+  Ingest:  chunks → extract entities+relations (LLM) → store graph
+           → community detection (BFS) → summarize communities (LLM)
+  Query:   query → extract entities (LLM) → traverse graph (Recursive CTE)
+           → inject community summaries into context → LLM answer
+
+Usage:
+  from graph_rag import build_graph, summarize_communities, graph_augment
+  from storage import ChunkStore
+
+  store = ChunkStore()
+  graph = GraphStore()
+
+  # Ingest phase (call after embed_chunks)
+  for chunk in chunks:
+      build_graph(chunk.content, chunk.metadata.get("source", ""), graph)
+  summarize_communities(graph)
+
+  # Query phase (call before LLM generation)
+  graph_ctx = graph_augment(user_query, graph)
+  context = graph_ctx + "\\n\\n---\\n\\n" + rag_context
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections import defaultdict, deque
+from dataclasses import dataclass
+
+from config import settings
+from exceptions import StorageError
+from llm import llm
+from storage import ChunkStore
+
+logger = logging.getLogger(__name__)
+
+
+# ── Data Models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class Entity:
+    name: str
+    type: str
+    description: str = ""
+
+@dataclass
+class Relation:
+    source: str
+    target: str
+    relation: str
+    weight: float = 1.0
+
+
+# ── LLM Prompts ───────────────────────────────────────────────────────────────
+
+_EXTRACT_PROMPT = """\
+Extract entities and relationships from this text.
+
+Text:
+\"\"\"
+{text}
+\"\"\"
+
+Respond ONLY with valid JSON:
+{{
+  "entities": [
+    {{"name": "Entity Name", "type": "PERSON|ORG|CONCEPT|LOCATION|EVENT", "description": "brief description"}}
+  ],
+  "relations": [
+    {{"source": "Entity A", "target": "Entity B", "relation": "relation_type", "weight": 0.8}}
+  ]
+}}
+
+Rules:
+- name: proper nouns, key concepts (3-10 per chunk)
+- relation: short verb phrase (e.g. "works_for", "located_in", "related_to")
+- weight: 0.0-1.0 strength of relation"""
+
+_COMMUNITY_PROMPT = """\
+Summarize the key themes from these related entities and connections.
+
+Entities: {entities}
+Relations: {relations}
+
+Write a 2-3 sentence summary focusing on the main topic, key relationships,
+and important insights for retrieval. Respond with ONLY the summary text."""
+
+_QUERY_ENTITY_PROMPT = """\
+Extract the main named entities from this search query for knowledge graph lookup.
+
+Query: {query}
+
+Respond ONLY with valid JSON: {{"entities": ["entity1", "entity2"]}}"""
+
+
+# ── Parsing ───────────────────────────────────────────────────────────────────
+
+def _parse_graph_response(response: str) -> tuple[list[Entity], list[Relation]]:
+    match = re.search(r'\{[\s\S]+\}', response)
+    if not match:
+        return [], []
+    try:
+        data = json.loads(match.group())
+        entities = [
+            Entity(
+                name=e.get("name", "").strip(),
+                type=e.get("type", "CONCEPT").upper(),
+                description=e.get("description", ""),
+            )
+            for e in data.get("entities", []) if e.get("name")
+        ]
+        relations = [
+            Relation(
+                source=r.get("source", "").strip(),
+                target=r.get("target", "").strip(),
+                relation=r.get("relation", "related_to"),
+                weight=float(r.get("weight", 1.0)),
+            )
+            for r in data.get("relations", []) if r.get("source") and r.get("target")
+        ]
+        return entities, relations
+    except (json.JSONDecodeError, KeyError, ValueError):
+        logger.debug("Graph extraction parse failed")
+        return [], []
+
+
+# ── Graph Storage ─────────────────────────────────────────────────────────────
+
+class GraphStore:
+    """PostgreSQL-backed knowledge graph using ChunkStore's connection pool."""
+
+    def __init__(self):
+        if ChunkStore._pool is None:
+            raise StorageError("Initialize ChunkStore before GraphStore.")
+        self._pool = ChunkStore._pool
+
+    def upsert_node(self, entity: Entity, source: str) -> int:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO graph_nodes (name, type, description, metadata)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE
+                        SET description = EXCLUDED.description,
+                            metadata = graph_nodes.metadata || EXCLUDED.metadata
+                    RETURNING id
+                    """,
+                    (entity.name, entity.type, entity.description,
+                     json.dumps({"sources": [source]})),
+                )
+                return cur.fetchone()[0]
+
+    def upsert_edge(self, source_id: int, target_id: int,
+                    relation: str, weight: float) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_edges (source_id, target_id, relation, weight)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (source_id, target_id, relation) DO UPDATE
+                    SET weight = GREATEST(graph_edges.weight, EXCLUDED.weight)
+                """,
+                (source_id, target_id, relation, weight),
+            )
+
+    def get_all_nodes(self) -> list[dict]:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name, type, description FROM graph_nodes")
+                return [
+                    {"id": r[0], "name": r[1], "type": r[2], "description": r[3]}
+                    for r in cur.fetchall()
+                ]
+
+    def get_all_edges(self) -> list[dict]:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT source_id, target_id, relation, weight FROM graph_edges"
+                )
+                return [
+                    {"source_id": r[0], "target_id": r[1],
+                     "relation": r[2], "weight": r[3]}
+                    for r in cur.fetchall()
+                ]
+
+    def set_community(self, node_id: int, community_id: int) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                "UPDATE graph_nodes SET community_id = %s WHERE id = %s",
+                (community_id, node_id),
+            )
+
+    def save_community_summary(self, community_id: int,
+                                node_ids: list[int], summary: str) -> None:
+        with self._pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_communities (id, node_ids, summary)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                    SET summary = EXCLUDED.summary, node_ids = EXCLUDED.node_ids
+                """,
+                (community_id, node_ids, summary),
+            )
+
+    def traverse(self, entity_names: list[str], max_depth: int = 2) -> list[dict]:
+        """Recursive CTE traversal — returns nodes within max_depth hops."""
+        if not entity_names:
+            return []
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH RECURSIVE walk AS (
+                        SELECT n.id, n.name, n.type, n.description,
+                               n.community_id, 0 AS depth
+                        FROM graph_nodes n
+                        WHERE n.name = ANY(%s)
+                        UNION ALL
+                        SELECT n.id, n.name, n.type, n.description,
+                               n.community_id, w.depth + 1
+                        FROM graph_nodes n
+                        JOIN graph_edges e
+                             ON (e.target_id = n.id OR e.source_id = n.id)
+                        JOIN walk w
+                             ON (w.id = e.source_id OR w.id = e.target_id)
+                        WHERE w.depth < %s AND n.id != w.id
+                    )
+                    SELECT DISTINCT w.id, w.name, w.type, w.description,
+                                    gc.summary
+                    FROM walk w
+                    LEFT JOIN graph_communities gc ON gc.id = w.community_id
+                    ORDER BY w.id
+                    LIMIT 50
+                    """,
+                    (entity_names, max_depth),
+                )
+                return [
+                    {"id": r[0], "name": r[1], "type": r[2],
+                     "description": r[3], "community_summary": r[4]}
+                    for r in cur.fetchall()
+                ]
+
+    def get_community_summaries(self, community_ids: list[int]) -> list[str]:
+        if not community_ids:
+            return []
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT summary FROM graph_communities "
+                    "WHERE id = ANY(%s) AND summary IS NOT NULL",
+                    (community_ids,),
+                )
+                return [r[0] for r in cur.fetchall()]
+
+
+# ── Community Detection (BFS Connected Components) ────────────────────────────
+
+def _detect_communities(nodes: list[dict],
+                         edges: list[dict]) -> dict[int, int]:
+    """
+    Community detection via connected components (BFS).
+    Returns {node_id: community_id}.
+
+    For production with large graphs, consider Leiden algorithm:
+      pip install graspologic
+      from graspologic.partition import leiden
+    """
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for e in edges:
+        adjacency[e["source_id"]].add(e["target_id"])
+        adjacency[e["target_id"]].add(e["source_id"])
+
+    visited: set[int] = set()
+    communities: dict[int, int] = {}
+    community_id = 0
+
+    for node in nodes:
+        nid = node["id"]
+        if nid in visited:
+            continue
+        queue = deque([nid])
+        while queue:
+            current = queue.popleft()
+            if current in visited:
+                continue
+            visited.add(current)
+            communities[current] = community_id
+            for neighbor in adjacency[current]:
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        community_id += 1
+
+    return communities
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def build_graph(text: str, source: str, graph_store: GraphStore) -> None:
+    """Extract entities/relations from text and store in knowledge graph."""
+    response = llm(_EXTRACT_PROMPT.format(text=text[:3000]), max_tokens=1000)
+    entities, relations = _parse_graph_response(response)
+
+    node_ids: dict[str, int] = {}
+    for entity in entities:
+        nid = graph_store.upsert_node(entity, source)
+        node_ids[entity.name] = nid
+
+    for rel in relations:
+        src_id = node_ids.get(rel.source)
+        tgt_id = node_ids.get(rel.target)
+        if src_id and tgt_id and src_id != tgt_id:
+            graph_store.upsert_edge(src_id, tgt_id, rel.relation, rel.weight)
+
+
+def summarize_communities(graph_store: GraphStore) -> None:
+    """Detect communities and generate LLM summaries for each."""
+    nodes = graph_store.get_all_nodes()
+    edges = graph_store.get_all_edges()
+    if not nodes:
+        logger.warning("No nodes to summarize")
+        return
+
+    communities = _detect_communities(nodes, edges)
+    for node_id, cid in communities.items():
+        graph_store.set_community(node_id, cid)
+
+    node_map = {n["id"]: n for n in nodes}
+    community_nodes: dict[int, list[dict]] = defaultdict(list)
+    community_edges: dict[int, list[dict]] = defaultdict(list)
+
+    for nid, cid in communities.items():
+        community_nodes[cid].append(node_map[nid])
+    for edge in edges:
+        cs = communities.get(edge["source_id"])
+        ct = communities.get(edge["target_id"])
+        if cs == ct and cs is not None:
+            community_edges[cs].append(edge)
+
+    for cid, cnodes in community_nodes.items():
+        if len(cnodes) < 2:
+            continue
+        entity_str = ", ".join(f"{n['name']} ({n['type']})" for n in cnodes[:15])
+        edge_subset = community_edges.get(cid, [])[:10]
+        relation_str = "; ".join(
+            f"{node_map.get(e['source_id'], {}).get('name', '?')}"
+            f" --[{e['relation']}]--> "
+            f"{node_map.get(e['target_id'], {}).get('name', '?')}"
+            for e in edge_subset
+        )
+        summary = llm(
+            _COMMUNITY_PROMPT.format(
+                entities=entity_str,
+                relations=relation_str or "none",
+            ),
+            max_tokens=200,
+        )
+        graph_store.save_community_summary(cid, [n["id"] for n in cnodes], summary)
+        logger.info("Community %d summarized (%d nodes)", cid, len(cnodes))
+
+
+def graph_augment(query: str, graph_store: GraphStore,
+                   max_depth: int = 2) -> str:
+    """
+    Augment query context with knowledge graph information.
+    Prepend the result to the RAG context before LLM generation.
+
+    Example:
+        graph_ctx = graph_augment(query, graph_store)
+        context = graph_ctx + "\\n\\n---\\n\\n" + rag_context
+    """
+    response = llm(_QUERY_ENTITY_PROMPT.format(query=query), max_tokens=100)
+    match = re.search(r'\{[\s\S]+\}', response)
+    entities: list[str] = []
+    if match:
+        try:
+            entities = json.loads(match.group()).get("entities", [])
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    if not entities:
+        return ""
+
+    related = graph_store.traverse(entities, max_depth=max_depth)
+    if not related:
+        return ""
+
+    parts = ["[Knowledge Graph Context]"]
+    community_ids = list({
+        r["community_id"] for r in related if r.get("community_id") is not None
+    })
+    for summary in graph_store.get_community_summaries(community_ids):
+        parts.append(f"Community insight: {summary}")
+
+    entity_lines = [
+        f"- {r['name']} ({r['type']}): {r['description']}"
+        for r in related if r.get("description")
+    ]
+    if entity_lines:
+        parts.append("Related entities:")
+        parts.extend(entity_lines[:10])
+
+    return "\n".join(parts)
+```
+
+**GraphRAG 인제스션 통합 예시:**
+
+```python
+# ingest_with_graph.py
+import sys
+from pathlib import Path
+from storage import ChunkStore
+from graph_rag import GraphStore, build_graph, summarize_communities
+from chunking import semantic_chunk
+from enrichment import enrich_chunk
+from embedding import embed_chunks
+
+def load_document(path: str) -> str:
+    import fitz
+    return "\n\n".join(page.get_text() for page in fitz.open(path))
+
+def ingest_with_graph(file_path: str, store: ChunkStore, graph: GraphStore):
+    text = load_document(file_path)
+    source = Path(file_path).name
+    chunks = semantic_chunk(text, source=source)
+    for chunk in chunks:
+        enrich_chunk(text, chunk)
+        build_graph(chunk.content, source, graph)   # ← graph 추가
+    embed_chunks(chunks)
+    store.store_batch(chunks)
+    print(f"  {source}: {len(chunks)} chunks + graph built")
+
+if __name__ == "__main__":
+    store = ChunkStore()
+    graph = GraphStore()
+    for path in sys.argv[1:]:
+        ingest_with_graph(path, store, graph)
+    print("Building community summaries...")
+    summarize_communities(graph)
+    ChunkStore.close_pool()
+```
 
 ### Multimodal RAG (ColPali for PDFs with images/tables)
 
