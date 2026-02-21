@@ -1,7 +1,7 @@
 # RAG Pipeline Skill for Claude Code
 
 > 30+ 기법/논문/벤치마크 리서치 기반의 프로덕션 RAG 파이프라인 구축 스킬
-> 108개 유닛 테스트 + validate_skill.py 검증 완료 (v1.3.0)
+> 108개 유닛 테스트 + validate_skill.py 검증 완료 (v1.4.0)
 
 Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 "RAG 만들어줘" 같은 요청을 하면 규모 판단 → 전략 선택 → 코드 생성까지 자동으로 가이드합니다.
@@ -145,6 +145,8 @@ Claude Code에서:
 | `crag.py` | CRAG 자가 수정 (JSON 구조화 응답 + Verdict enum + DuckDuckGo 웹 폴백) |
 | `pipeline.py` | 풀 쿼리 파이프라인 (입력 검증 + 프롬프트 인젝션 방어) |
 | `graph_rag.py` | **GraphRAG** — PostgreSQL 지식 그래프 + BFS 커뮤니티 탐지 + Recursive CTE 순회 |
+| `acl.py` | **권한 관리** — 역할 기반 접근 제어 (RBAC), 문서별 AccessLevel 태깅 |
+| `smart_ingest.py` | **스마트 재인제스션** — 같은 PDF 다시 넣으면 자동 업데이트 + ACL 지원 |
 | `ingest.py` | 인제스션 3종 (Small / Medium / Large 규모별) |
 | `ingest_with_graph.py` | GraphRAG 통합 인제스션 예시 |
 | `agentic_rag.py` | 에이전틱 RAG (tool_use 기반 자율 검색) |
@@ -262,6 +264,14 @@ pytest --cov=. --cov-report=html
 `validate_skill.py`는 SKILL.md의 모든 Python 코드 블록을 자동 추출해 문법 검사합니다. CI에서 자동 실행됩니다.
 
 ## 변경 이력
+
+### v1.4.0 (2026-02-21)
+- **권한 관리 (RBAC) 추가**: `acl.py` — AccessLevel 열거형 + 역할 계층 (employee → hr → finance → executive)
+- **스마트 재인제스션**: `smart_ingest.py` — `python smart_ingest.py --role hr doc.pdf` 한 줄로 최초 인제스션/업데이트 통합
+  - 같은 파일명 감지 시 자동 삭제 후 재인제스션 (수동 delete 불필요)
+  - `GraphStore.delete_by_source()` 추가 — 그래프 노드도 함께 정리
+- `hybrid_search()` ACL 파라미터 추가 (`allowed_levels`)
+- `pipeline.py` `user_role` 파라미터 추가
 
 ### v1.3.0 (2026-02-21)
 - **GraphRAG 구현**: `graph_rag.py` — PostgreSQL 기반 지식 그래프 (추가 인프라 불필요)

@@ -1568,6 +1568,247 @@ if __name__ == "__main__":
     ChunkStore.close_pool()
 ```
 
+### 권한 관리 (Role-Based Access Control)
+
+```
+문서 태깅:  ingest 시 chunk.metadata["access_level"] = "hr"
+검색 필터:  hybrid_search(allowed_levels=["public", "hr"])
+                → SQL WHERE metadata->>'access_level' = ANY(allowed_levels)
+```
+
+```python
+# acl.py
+"""
+Role-based Access Control for RAG pipeline.
+
+Workflow:
+  Ingestion: tag_chunk(chunk, AccessLevel.HR)
+  Query:     levels = get_accessible_levels(user_role="hr")
+             results = store.hybrid_search(emb, query, allowed_levels=levels)
+
+Role hierarchy:
+  executive  → public + hr + finance + executive
+  hr         → public + hr
+  finance    → public + finance
+  employee   → public only
+"""
+from enum import Enum
+
+
+class AccessLevel(str, Enum):
+    PUBLIC       = "public"        # 전 직원 공개
+    HR           = "hr"            # 인사팀 이상
+    FINANCE      = "finance"       # 재무팀 이상
+    EXECUTIVE    = "executive"     # 임원 이상
+    CONFIDENTIAL = "confidential"  # 명시적으로 부여된 사람만
+
+
+# 역할 → 접근 가능한 레벨 목록 (상위 역할은 하위 포함)
+_ROLE_ACCESS: dict[str, set[str]] = {
+    "executive": {"public", "hr", "finance", "executive"},
+    "hr":        {"public", "hr"},
+    "finance":   {"public", "finance"},
+    "employee":  {"public"},
+}
+
+
+def get_accessible_levels(user_role: str) -> list[str]:
+    """사용자 역할로 접근 가능한 access_level 목록 반환."""
+    return list(_ROLE_ACCESS.get(user_role, {"public"}))
+
+
+def tag_chunk(chunk, access_level: "AccessLevel | str") -> None:
+    """청크에 접근 레벨 태깅 — 인제스션 시 호출."""
+    level = access_level.value if isinstance(access_level, AccessLevel) else access_level
+    chunk.metadata["access_level"] = level
+```
+
+**storage.py 수정 — hybrid_search에 ACL 파라미터 추가:**
+
+```python
+# storage.py (hybrid_search 수정 부분만)
+_RRF_SQL_ACL = """
+WITH semantic AS (
+    SELECT id, content, context, summary, metadata,
+           ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) AS rank_s
+    FROM chunks
+    WHERE (metadata->>'access_level' IS NULL
+           OR metadata->>'access_level' = ANY(%s))
+    ORDER BY embedding <=> %s::vector LIMIT %s
+),
+keyword AS (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               ORDER BY ts_rank(search_vector, plainto_tsquery('simple', %s)) DESC
+           ) AS rank_k
+    FROM chunks
+    WHERE search_vector @@ plainto_tsquery('simple', %s)
+      AND (metadata->>'access_level' IS NULL
+           OR metadata->>'access_level' = ANY(%s))
+    LIMIT %s
+)
+SELECT s.id, s.content, s.context, s.summary, s.metadata,
+       (1.0/(60+s.rank_s)) + COALESCE(1.0/(60+k.rank_k), 0) AS rrf_score
+FROM semantic s
+LEFT JOIN keyword k ON s.id = k.id
+ORDER BY rrf_score DESC LIMIT %s
+"""
+
+def hybrid_search(self, query_embedding: list, query_text: str,
+                  top_k: int = 20,
+                  allowed_levels: list[str] | None = None) -> list[dict]:
+    """RRF hybrid search with optional ACL filtering."""
+    # allowed_levels=None → 모든 레벨 접근 허용 (관리자/내부 용도)
+    levels = allowed_levels or list(AccessLevel.__members__.values())
+    with self._pool.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_RRF_SQL_ACL, (
+                query_embedding, levels, query_embedding, top_k * 2,
+                query_text, query_text, levels, top_k * 2,
+                top_k,
+            ))
+            return cur.fetchall()
+```
+
+**pipeline.py 수정 — user_role 파라미터 추가:**
+
+```python
+# pipeline.py (QueryRequest + query() 수정 부분만)
+from acl import get_accessible_levels
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+    use_crag: bool = True
+    user_role: str = "employee"   # 추가
+
+    @field_validator("user_role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        valid = {"employee", "hr", "finance", "executive"}
+        if v not in valid:
+            raise ValueError(f"Unknown role: {v}")
+        return v
+
+def query(user_query: str, store: "ChunkStore", top_k: int = 5,
+          use_crag: bool = True, user_role: str = "employee") -> dict:
+    req = QueryRequest(query=user_query, top_k=top_k,
+                       use_crag=use_crag, user_role=user_role)
+    allowed_levels = get_accessible_levels(req.user_role)   # ACL 변환
+
+    query_emb = embed_query(req.query)
+    candidates = store.hybrid_search(
+        query_emb, req.query,
+        top_k=req.top_k * 3,
+        allowed_levels=allowed_levels,    # ACL 적용
+    )
+    # 이후 rerank → CRAG → generate 동일
+```
+
+---
+
+### 스마트 재인제스션 (Auto-Update)
+
+```
+기존 방식: 문서 바뀌면 → 수동으로 delete → 다시 ingest
+스마트 방식: 같은 PDF 다시 넣으면 → 자동으로 기존 삭제 후 재인제스션
+```
+
+```python
+# smart_ingest.py
+"""
+Smart ingestion with auto-update and access control.
+
+Usage:
+  # 최초 인제스션 or 업데이트 (동일 명령)
+  python smart_ingest.py ./docs/vacation_policy.pdf            # public
+  python smart_ingest.py --role hr ./docs/salary_table.pdf     # HR only
+  python smart_ingest.py --role executive ./docs/board.pdf     # 임원만
+
+  # 여러 파일 동시
+  python smart_ingest.py --role finance ./finance/*.pdf
+"""
+import sys
+import argparse
+from pathlib import Path
+
+from storage import ChunkStore
+from graph_rag import GraphStore, build_graph, summarize_communities
+from chunking import semantic_chunk
+from enrichment import enrich_chunk
+from embedding import embed_chunks
+from acl import AccessLevel, tag_chunk
+
+
+def load_document(path: str) -> str:
+    import fitz
+    return "\n\n".join(page.get_text() for page in fitz.open(path))
+
+
+def smart_ingest(file_path: str, store: ChunkStore, graph: GraphStore,
+                 access_level: AccessLevel = AccessLevel.PUBLIC) -> int:
+    """
+    문서 인제스션 — 이미 있으면 자동 업데이트.
+    같은 파일명의 청크와 그래프 노드를 먼저 삭제 후 재인제스션.
+    """
+    source = Path(file_path).name
+
+    # 기존 데이터 삭제 (최초 인제스션이면 skip, 업데이트면 정리)
+    store.delete_by_source(source)
+    graph.delete_by_source(source)
+
+    text = load_document(file_path)
+    chunks = semantic_chunk(text, source=source)
+
+    for chunk in chunks:
+        enrich_chunk(text, chunk)
+        tag_chunk(chunk, access_level)          # 접근 레벨 태깅
+        build_graph(chunk.content, source, graph)
+
+    embed_chunks(chunks)
+    store.store_batch(chunks)
+    return len(chunks)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Smart RAG ingestion with ACL")
+    parser.add_argument("files", nargs="+", help="PDF file paths")
+    parser.add_argument(
+        "--role", default="public",
+        choices=["public", "hr", "finance", "executive", "confidential"],
+        help="Access level for these documents (default: public)",
+    )
+    args = parser.parse_args()
+
+    store = ChunkStore()
+    graph = GraphStore()
+    access = AccessLevel(args.role)
+
+    for path in args.files:
+        n = smart_ingest(path, store, graph, access_level=access)
+        print(f"  {path}: {n} chunks (level={access.value})")
+
+    print("Building community summaries...")
+    summarize_communities(graph)
+    ChunkStore.close_pool()
+    print("Done.")
+```
+
+**GraphStore.delete_by_source 추가 (graph_rag.py에 메서드 추가):**
+
+```python
+# graph_rag.py — GraphStore에 추가
+def delete_by_source(self, source: str) -> None:
+    """특정 소스에서 추출된 노드/엣지 삭제 (재인제스션 시 호출)."""
+    with self._pool.connection() as conn:
+        # metadata->>'sources' 배열에서 해당 소스가 있는 노드 삭제
+        # ON DELETE CASCADE로 연결된 엣지도 자동 삭제
+        conn.execute(
+            "DELETE FROM graph_nodes WHERE metadata->'sources' ? %s",
+            (source,),
+        )
+```
+
 ### Multimodal RAG (ColPali for PDFs with images/tables)
 
 ```
