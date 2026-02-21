@@ -1,7 +1,7 @@
 # RAG Pipeline Skill for Claude Code
 
 > 30+ 기법/논문/벤치마크 리서치 기반의 프로덕션 RAG 파이프라인 구축 스킬
-> 68개 유닛 테스트 + validate_skill.py 검증 완료 (v1.2.0)
+> 108개 유닛 테스트 + validate_skill.py 검증 완료 (v1.3.0)
 
 Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 "RAG 만들어줘" 같은 요청을 하면 규모 판단 → 전략 선택 → 코드 생성까지 자동으로 가이드합니다.
@@ -122,7 +122,7 @@ Claude Code에서:
 |------|------|-----------|
 | Naive RAG | chunk → embed → search → generate | 프로토타입 |
 | **Advanced RAG** | + 하이브리드 검색 + 리랭킹 | 일반 프로덕션 |
-| Graph RAG | 지식 그래프 + 커뮤니티 요약 | 멀티홉 추론 |
+| **Graph RAG** ✅ | 지식 그래프 + 커뮤니티 요약 (구현 완료) | 멀티홉 추론 |
 | **Agentic RAG** | 에이전트가 검색 전략 결정 | 복잡한 쿼리 |
 | **Corrective RAG** | 검색 품질 검증 + 웹 폴백 | 높은 신뢰도 |
 | Self-RAG | 모델이 검색 필요 여부 판단 | 효율 최적화 |
@@ -144,11 +144,13 @@ Claude Code에서:
 | `reranker.py` | Voyage rerank-2 Cross-encoder |
 | `crag.py` | CRAG 자가 수정 (JSON 구조화 응답 + Verdict enum + DuckDuckGo 웹 폴백) |
 | `pipeline.py` | 풀 쿼리 파이프라인 (입력 검증 + 프롬프트 인젝션 방어) |
+| `graph_rag.py` | **GraphRAG** — PostgreSQL 지식 그래프 + BFS 커뮤니티 탐지 + Recursive CTE 순회 |
 | `ingest.py` | 인제스션 3종 (Small / Medium / Large 규모별) |
+| `ingest_with_graph.py` | GraphRAG 통합 인제스션 예시 |
 | `agentic_rag.py` | 에이전틱 RAG (tool_use 기반 자율 검색) |
 | `evaluation.py` | RAGAS 0.4+ 평가 (Gemini/OpenAI/Claude 지원) |
 | `monitoring.py` | Langfuse 분산 추적 |
-| `schema.sql` | pgvector 테이블 + HNSW/GIN 인덱스 |
+| `schema.sql` | pgvector + GraphRAG 테이블 + HNSW/GIN 인덱스 |
 
 ## API 키
 
@@ -251,14 +253,25 @@ pytest --cov=. --cov-report=html
 | `test_chunking.py` | 12 | `chunking.py` |
 | `test_embedding.py` | 10 | `embedding.py` |
 | `test_enrichment.py` | 8 | `enrichment.py` |
-| `test_storage.py` | 10 | `storage.py` |
+| `test_storage.py` | 7 | `storage.py` |
 | `test_crag.py` | 14 | `crag.py` |
-| `test_pipeline.py` | 14 | `pipeline.py` |
-| **합계** | **68** | **97%** |
+| `test_pipeline.py` | 17 | `pipeline.py` |
+| `test_graph_rag.py` | 40 | `graph_rag.py` |
+| **합계** | **108** | **97%+** |
 
 `validate_skill.py`는 SKILL.md의 모든 Python 코드 블록을 자동 추출해 문법 검사합니다. CI에서 자동 실행됩니다.
 
 ## 변경 이력
+
+### v1.3.0 (2026-02-21)
+- **GraphRAG 구현**: `graph_rag.py` — PostgreSQL 기반 지식 그래프 (추가 인프라 불필요)
+  - 엔티티/관계 추출 (LLM), BFS 커뮤니티 탐지, LLM 커뮤니티 요약
+  - 쿼리 시 Recursive CTE 그래프 순회 + 컨텍스트 자동 보강
+  - 포괄성 **72-83% 향상**, 다양성 **62-82% 향상** (Microsoft 연구)
+- **schema.sql** 확장: `graph_nodes`, `graph_edges`, `graph_communities` 테이블 추가
+- **테스트 40개 추가** (`test_graph_rag.py`): 파싱/커뮤니티 탐지/DB ops/통합 흐름
+- **버그 수정**: `graph_augment()` 이중 DB 쿼리 제거 (traverse SQL이 이미 커뮤니티 요약 JOIN)
+- 총 테스트: 68 → **108개**
 
 ### v1.2.0 (2026-02-20)
 - **테스트 인프라 추가**: 68개 유닛 테스트, `validate_skill.py`, GitHub Actions CI
