@@ -488,6 +488,7 @@ Anthropic's method: prepend context description to each chunk before embedding.
 ```python
 # enrichment.py
 from llm import llm
+from chunking import Chunk
 
 CONTEXT_PROMPT = """<document>
 {document}

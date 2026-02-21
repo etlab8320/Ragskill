@@ -1,7 +1,7 @@
 # RAG Pipeline Skill for Claude Code
 
 > 30+ 기법/논문/벤치마크 리서치 기반의 프로덕션 RAG 파이프라인 구축 스킬
-> 108개 유닛 테스트 + validate_skill.py 검증 완료 (v1.4.0)
+> 134개 유닛 테스트 + validate_skill.py 검증 완료 (v1.4.0)
 
 Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 "RAG 만들어줘" 같은 요청을 하면 규모 판단 → 전략 선택 → 코드 생성까지 자동으로 가이드합니다.

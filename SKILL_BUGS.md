@@ -13,6 +13,13 @@
 - **수정**: SKILL.md storage.py 블록 상단에 `from chunking import Chunk` 추가
 - **테스트**: `test_store_batch_uses_executemany` → PASS
 
+### BUG-03: enrichment.py — `from chunking import Chunk` 누락
+- **파일**: `enrichment.py` 블록
+- **증상**: `smart_ingest` import 시 `NameError: name 'Chunk' is not defined`
+- **원인**: `enrich_chunk(full_doc: str, chunk: Chunk)` 시그니처에 `Chunk` 사용하지만 import 없음
+- **수정**: SKILL.md enrichment.py 블록에 `from chunking import Chunk` 추가
+- **테스트**: `TestSmartIngest` 전체 → PASS (2026-02-21)
+
 ### BUG-02: llm.py — 구버전 google.generativeai SDK 사용
 - **파일**: `llm.py` 블록 (`_call_gemini` 함수)
 - **증상**: `import google.generativeai as genai` → `DeprecationWarning` 또는 `ImportError` (신규 설치 시)
