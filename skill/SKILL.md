@@ -1511,11 +1511,14 @@ def graph_augment(query: str, graph_store: GraphStore,
         return ""
 
     parts = ["[Knowledge Graph Context]"]
-    community_ids = list({
-        r["community_id"] for r in related if r.get("community_id") is not None
-    })
-    for summary in graph_store.get_community_summaries(community_ids):
-        parts.append(f"Community insight: {summary}")
+
+    # traverse SQL already JOINs community summaries — no second DB call needed
+    seen_summaries: set[str] = set()
+    for r in related:
+        summary = r.get("community_summary")
+        if summary and summary not in seen_summaries:
+            parts.append(f"Community insight: {summary}")
+            seen_summaries.add(summary)
 
     entity_lines = [
         f"- {r['name']} ({r['type']}): {r['description']}"
