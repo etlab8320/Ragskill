@@ -1,7 +1,7 @@
 # RAG Pipeline Skill for Claude Code
 
 > 30+ 기법/논문/벤치마크 리서치 기반의 프로덕션 RAG 파이프라인 구축 스킬
-> 134개 유닛 테스트 + validate_skill.py 검증 완료 (v1.4.0)
+> 163개 유닛 테스트 + validate_skill.py 검증 완료 (v1.5.0)
 
 Claude Code에서 `/rag-pipeline` 명령으로 사용합니다.
 "RAG 만들어줘" 같은 요청을 하면 규모 판단 → 전략 선택 → 코드 생성까지 자동으로 가이드합니다.
@@ -241,7 +241,7 @@ cd tests/
 # 1. SKILL.md 코드 블록 추출 + 문법 검증
 python validate_skill.py
 
-# 2. 유닛 테스트 전체 실행 (68개)
+# 2. 유닛 테스트 전체 실행 (163개)
 pytest -v --cov=. --cov-report=term-missing
 
 # 커버리지 보고서 HTML
@@ -259,11 +259,23 @@ pytest --cov=. --cov-report=html
 | `test_crag.py` | 14 | `crag.py` |
 | `test_pipeline.py` | 17 | `pipeline.py` |
 | `test_graph_rag.py` | 40 | `graph_rag.py` |
-| **합계** | **108** | **97%+** |
+| `test_acl.py` + `test_smart_ingest.py` | 26 | `acl.py`, `smart_ingest.py` |
+| `test_evaluation.py` | 15 | `evaluation.py` |
+| `test_monitoring.py` | 10 | `monitoring.py` |
+| `test_agentic_rag.py` | 15 | `agentic_rag.py` |
+| **합계** | **163** | **97%+** |
 
 `validate_skill.py`는 SKILL.md의 모든 Python 코드 블록을 자동 추출해 문법 검사합니다. CI에서 자동 실행됩니다.
 
 ## 변경 이력
+
+### v1.5.0 (2026-03-06)
+- **Evaluation 테스트 15개 추가**: `test_evaluation.py` — RAGAS `_get_ragas_llm()` 라우팅 (gemini/openai/claude) + `evaluate_rag()` 호출 검증
+- **Monitoring 테스트 10개 추가**: `test_monitoring.py` — Langfuse trace/span 라이프사이클 + 출력 구조 검증
+- **Agentic RAG 테스트 15개 추가**: `test_agentic_rag.py` — tool dispatch (search_documents, get_document_list) + 반복 로직 + 종료 조건
+- **conftest.py 중앙 mock 인프라**: 12+ 외부 모듈 (ragas, langfuse, voyageai, psycopg 등) sys.modules 사전 등록
+- **agentic_rag.py 수정**: `get_document_list` stub → `store.get_unique_sources()` 실제 구현, 누락 import 추가
+- 테스트 에러 46 → 0 (중앙 mock으로 100% 제거), 총 테스트: 134 → **163개**
 
 ### v1.4.0 (2026-02-21)
 - **권한 관리 (RBAC) 추가**: `acl.py` — AccessLevel 열거형 + 역할 계층 (employee → hr → finance → executive)
