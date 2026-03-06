@@ -1028,7 +1028,12 @@ def query(user_query: str, store: "ChunkStore", top_k: int = 5, use_crag: bool =
 Requires API mode (RAG_LLM_MODE=claude-api).
 Implementation below uses Anthropic Messages API.
 """
+from __future__ import annotations
+
 from llm import get_api_client
+from embedding import embed_query
+from reranker import rerank
+
 client, model_name, provider = get_api_client()
 if provider != "anthropic":
     raise NotImplementedError("Agentic RAG currently supports only RAG_LLM_MODE=claude-api in this template.")
@@ -1092,8 +1097,10 @@ def agentic_query(user_query: str, store: ChunkStore) -> str:
                         for r in reranked
                     ])
                 elif block.name == "get_document_list":
-                    # Return unique sources
-                    tool_result = "Available sources: ..."
+                    sources = store.get_unique_sources()
+                    tool_result = "Available sources:\n" + "\n".join(
+                        f"- {s}" for s in sources
+                    ) if sources else "No documents ingested yet."
 
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": [
@@ -1967,6 +1974,8 @@ if __name__ == "__main__":
 
 ```python
 # monitoring.py
+from __future__ import annotations
+
 from langfuse import Langfuse
 from embedding import embed_query
 from reranker import rerank

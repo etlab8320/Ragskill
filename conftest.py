@@ -44,6 +44,61 @@ def _setup_skill_modules() -> str:
 
 # conftest.py 로드(= collection 전) 시점에 즉시 실행
 _modules_dir = _setup_skill_modules()
+
+# ── External dependency mocks ─────────────────────────────────────────────────
+# SKILL.md modules depend on packages not installed in test env.
+# Register mocks BEFORE sys.path so imports resolve without real packages.
+from unittest.mock import MagicMock as _MM
+
+# pydantic_settings → config.py
+_ps = _MM()
+_ps.BaseSettings = type("BaseSettings", (), {"model_config": {}})
+sys.modules.setdefault("pydantic_settings", _ps)
+
+# psycopg → storage.py
+_psycopg = _MM()
+_psycopg.rows = _MM()
+_psycopg.rows.dict_row = _MM()
+sys.modules.setdefault("psycopg", _psycopg)
+sys.modules.setdefault("psycopg.rows", _psycopg.rows)
+sys.modules.setdefault("psycopg_pool", _MM())
+
+# voyageai → embedding.py
+sys.modules.setdefault("voyageai", _MM())
+
+# sentence_transformers → embedding.py fallback
+sys.modules.setdefault("sentence_transformers", _MM())
+
+# tenacity → embedding.py retry decorators
+_tenacity = _MM()
+_tenacity.retry = lambda **kw: (lambda f: f)
+_tenacity.wait_exponential = _MM()
+_tenacity.stop_after_attempt = _MM()
+_tenacity.retry_if_exception_type = _MM()
+_tenacity.before_sleep_log = _MM()
+sys.modules.setdefault("tenacity", _tenacity)
+
+# exceptions → embedding.py custom exceptions
+_exc = _MM()
+_exc.EmbeddingError = type("EmbeddingError", (Exception,), {})
+_exc.RateLimitError = type("RateLimitError", (Exception,), {})
+_exc.StorageError = type("StorageError", (Exception,), {})
+sys.modules.setdefault("exceptions", _exc)
+
+# ragas → evaluation.py
+for _mod in [
+    "ragas", "ragas.evaluate", "ragas.dataset_schema",
+    "ragas.metrics", "ragas.metrics.collections", "ragas.llms",
+]:
+    sys.modules.setdefault(_mod, _MM())
+
+# langchain → evaluation.py
+for _mod in ["langchain_google_genai", "langchain_openai", "langchain_anthropic"]:
+    sys.modules.setdefault(_mod, _MM())
+
+# langfuse → monitoring.py
+sys.modules.setdefault("langfuse", _MM())
+
 sys.path.insert(0, _modules_dir)
 
 # 프로세스 종료 시 임시 디렉토리 정리
